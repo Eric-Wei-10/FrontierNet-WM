@@ -53,4 +53,4 @@ data/
 # files
 output/
 model_weights/
-
+*.err

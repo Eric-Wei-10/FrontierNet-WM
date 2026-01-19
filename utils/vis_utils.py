@@ -41,7 +41,7 @@ def create_interactive_vis(
     vis = o3d.visualization.VisualizerWithKeyCallback()
     assert H == camera_intrinsic.height
     assert W == camera_intrinsic.width
-    vis.create_window(width=W, height=H)
+    vis.create_window(width=W, height=H, visible=False)
     vis.get_render_option().mesh_show_back_face = show_back_face
     vis.get_render_option().light_on = light_on
     ctr = set_viewpoint_ctr(vis, z_near, z_far)
@@ -654,3 +654,53 @@ def visualize_2D_frontier(
         )
 
     return vis
+
+# headless
+## --- ADD TO vis_utils.py ---
+
+def is_headless(vis):
+    # OffscreenRenderer has a 'scene' attribute, Visualizer does not.
+    return hasattr(vis, "scene")
+
+def get_vis_state(vis):
+    if is_headless(vis):
+        # OffscreenRenderer doesn't 'store' state for retrieval easily.
+        # For simplicity in this script, we assume setup_camera was called.
+        # In a real app, you might want to cache these in the App class.
+        return None 
+    
+    ctr = vis.get_view_control()
+    param = ctr.convert_to_pinhole_camera_parameters()
+    return {"cam_intrinsic": param.intrinsic, "cam_extrinsic": param.extrinsic}
+
+def set_vis_cam_ex(vis, cam_extrinsic, intrinsic=None):
+    if is_headless(vis):
+        # OffscreenRenderer uses setup_camera(intrinsic, extrinsic)
+        # intrinsic must be an o3d.camera.PinholeCameraIntrinsic object
+        vis.setup_camera(intrinsic, cam_extrinsic)
+    else:
+        ctr = vis.get_view_control()
+        param = ctr.convert_to_pinhole_camera_parameters()
+        param.extrinsic = cam_extrinsic
+        if intrinsic: param.intrinsic = intrinsic
+        ctr.convert_from_pinhole_camera_parameters(param, allow_arbitrary=True)
+
+def capture_rgb(vis, return_rgb_type="np"):
+    if is_headless(vis):
+        image = vis.render_to_image()
+        img_np = np.asarray(image)
+        return {"image": img_np}
+    else:
+        # Your existing Visualizer logic
+        color_image = vis.capture_screen_float_buffer(True)
+        img_np = (np.asarray(color_image) * 255).astype(np.uint8)
+        return {"image": img_np}
+
+def capture_depth(vis, return_depth_type="np"):
+    if is_headless(vis):
+        depth_image = vis.render_to_depth_image(z_in_view_space=True)
+        depth_np = np.asarray(depth_image)
+        return {"depth": depth_np}
+    else:
+        depth_image = vis.capture_depth_float_buffer(True)
+        return {"depth": np.asarray(depth_image).astype(np.float32)}

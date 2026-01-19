@@ -41,6 +41,7 @@ trimesh
 triton>=2.4.0
 
 # pywavemap
+# euler: conda install -c conda-forge glog=0.6.0 gflags=2.2.2
 # (if building wheels fail:) export CMAKE_POLICY_VERSION_MINIMUM=3.5
 git+https://github.com/ethz-asl/wavemap#subdirectory=library/python
 

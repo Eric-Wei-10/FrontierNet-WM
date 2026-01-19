@@ -56,20 +56,26 @@ def plot_result(result_path):
 
     # concatenate and display
     combined = np.concatenate([pre_bgr, vis_df, vis_info, vis_ft2d], axis=1)
-    window = "RGB | DF | InfoGain | 2D Frontier"
-    print("Displayed 2D overlays. Press any key to continue to 3D visualization...")
-    cv2.imshow(window, combined)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    
+    # save
+    save_path = Path(result_path).with_suffix('.png')
+    cv2.imwrite(str(save_path), combined)
+    print(f"2D visualization saved to {save_path}")
+    
+    # window = "RGB | DF | InfoGain | 2D Frontier"
+    # print("Displayed 2D overlays. Press any key to continue to 3D visualization...")
+    # cv2.imshow(window, combined)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
 
     # 3D visualization
-    visualize_3D_frontier(
-        ft_3D,
-        intrinsic=ori_intrinsic,
-        extrinsic=extrinsic,
-        rgb=rgb,
-        depth=depth,
-    )
+    # visualize_3D_frontier(
+    #     ft_3D,
+    #     intrinsic=ori_intrinsic,
+    #     extrinsic=extrinsic,
+    #     rgb=rgb,
+    #     depth=depth,
+    # )
 
 
 if __name__ == "__main__":

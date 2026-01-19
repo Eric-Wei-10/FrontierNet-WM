@@ -169,10 +169,34 @@ def plot_exploration_curve(
     
     # Add final ratio annotation
     if ratios:
+
+        # vox@25
+        vox_at_25_ratio = ratios[int(len(ratios) * 0.25)]
+        ax.axhline(y=vox_at_25_ratio, color='r', linestyle='--', alpha=0.5)
+        ax.annotate(
+            f'vox@25: {vox_at_25_ratio:.2%}',
+            xy=(steps[int(len(steps) * 0.25)], vox_at_25_ratio),
+            xytext=(steps[int(len(steps) * 0.25)] * 0.8, vox_at_25_ratio + 0.05),
+            fontsize=10,
+            arrowprops=dict(arrowstyle='->', color='red', alpha=0.5)
+        )
+
+        # vox@50
+        vox_at_50_ratio = ratios[int(len(ratios) * 0.50)]
+        ax.axhline(y=vox_at_50_ratio, color='r', linestyle='--', alpha=0.5)
+        ax.annotate(
+            f'vox@50: {vox_at_50_ratio:.2%}',
+            xy=(steps[int(len(steps) * 0.50)], vox_at_50_ratio),
+            xytext=(steps[int(len(steps) * 0.50)] * 0.8, vox_at_50_ratio + 0.05),
+            fontsize=10,
+            arrowprops=dict(arrowstyle='->', color='red', alpha=0.5)
+        )
+
+        # vox@100
         final_ratio = ratios[-1]
         ax.axhline(y=final_ratio, color='r', linestyle='--', alpha=0.5)
         ax.annotate(
-            f'Final: {final_ratio:.2%}',
+            f'vox@100: {final_ratio:.2%}',
             xy=(steps[-1], final_ratio),
             xytext=(steps[-1] * 0.8, final_ratio + 0.05),
             fontsize=10,
