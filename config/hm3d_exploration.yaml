@@ -1,7 +1,7 @@
 # ------ FrontierNet Model ------
 df_normalizer: 10 
 df_thr: 0.3
-num_classes: 11
+num_classes: 7
 input_img_size: [320, 320]
 focal_length: 300.0 
 

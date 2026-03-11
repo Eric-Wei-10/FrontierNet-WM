@@ -11,6 +11,7 @@ from typing import Optional, List, Tuple
 from pathlib import Path
 import numpy as np
 import torch
+import cv2
 import open3d as o3d
 import open3d.visualization.rendering as rendering
 
@@ -256,6 +257,10 @@ class HeadlessExplorerApp:
         os.makedirs(save_dir, exist_ok=True)
         self.json_path: str = args.write_path or None
 
+        # Debug visualisation (empty string → disabled)
+        self.debug_dir: Optional[str] = args.debug_dir or None
+        self._debug_step: int = 0
+
     # ---------- RGBD capture ----------
 
     def get_rgbd(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -295,6 +300,74 @@ class HeadlessExplorerApp:
             self.last_W_T_C.reshape(1, 4, 4), current_pose.reshape(1, 4, 4)
         )
         return trans_diff[0, 0] > trans_thre or rot_diff[0, 0] > rot_thre
+
+    # ---------- debug visualisation ----------
+
+    def _save_debug_image(self) -> None:
+        """
+        Save a side-by-side debug strip after each inference step:
+          RGB | Depth | Distance Field (projected to frame-0) | Frontier Region | Info Gain
+        All panels are resized to the same height and labelled before concatenation.
+        """
+        if self.debug_dir is None or self.ft_detector is None:
+            return
+
+        det = self.ft_detector
+        PANEL_H = 320  # target height for every panel
+
+        def to_colormap(arr: np.ndarray, cmap: int = cv2.COLORMAP_JET) -> np.ndarray:
+            """Normalise a 2-D float array to [0,255] and apply a cv2 colormap."""
+            arr = arr.astype(np.float32)
+            mn, mx = arr.min(), arr.max()
+            normed = ((arr - mn) / (mx - mn) * 255).astype(np.uint8) if mx > mn else np.zeros_like(arr, dtype=np.uint8)
+            return cv2.applyColorMap(normed, cmap)
+
+        def resize_h(img: np.ndarray, h: int) -> np.ndarray:
+            oh, ow = img.shape[:2]
+            return cv2.resize(img, (max(1, int(ow * h / oh)), h))
+
+        def add_label(panel: np.ndarray, title: str) -> np.ndarray:
+            bar = np.zeros((28, panel.shape[1], 3), dtype=np.uint8)
+            cv2.putText(bar, title, (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+            return np.vstack([bar, panel])
+
+        panels = []
+
+        # 1. RGB (original resolution, uint8)
+        if det.raw_rgb is not None:
+            rgb_bgr = cv2.cvtColor(det.raw_rgb[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR)
+            panels.append(add_label(resize_h(rgb_bgr, PANEL_H), "RGB"))
+
+        # 2. Depth (original resolution, colourised)
+        if det.raw_depth is not None:
+            panels.append(add_label(resize_h(to_colormap(det.raw_depth), PANEL_H), "Depth"))
+
+        # 3a. Raw Distance Field (frame-48 coordinates, before projection)
+        if det.df_raw is not None:
+            panels.append(add_label(resize_h(to_colormap(det.df_raw), PANEL_H), "DF raw (frame-48)"))
+
+        # 3b. Distance Field projected to frame-0
+        if det.df is not None:
+            panels.append(add_label(resize_h(to_colormap(det.df), PANEL_H), "DF (frame-0)"))
+
+        # 4. Frontier Region (binary mask)
+        if det.ft_region is not None:
+            ft_gray = (det.ft_region * 255).astype(np.uint8)
+            panels.append(add_label(resize_h(cv2.cvtColor(ft_gray, cv2.COLOR_GRAY2BGR), PANEL_H), "FT Region"))
+
+        # 5. Info Gain
+        if det.info_gain is not None:
+            panels.append(add_label(resize_h(to_colormap(det.info_gain), PANEL_H), "Info Gain"))
+
+        if not panels:
+            return
+
+        strip = np.hstack(panels)
+        os.makedirs(self.debug_dir, exist_ok=True)
+        out_path = os.path.join(self.debug_dir, f"step_{self._debug_step:04d}.png")
+        cv2.imwrite(out_path, strip)
+        logging.info("Saved debug image: %s", out_path)
+        self._debug_step += 1
 
     # ---------- main exploration logic ----------
 
@@ -359,6 +432,7 @@ class HeadlessExplorerApp:
                     df_normalizer=self.config["df_normalizer"],
                     df_thr=self.config["df_thr"],
                 )
+                self._save_debug_image()
                 ft_list = self.ft_detector.anchor_fts(depth=depth, extrinsic=C_T_W)
 
                 # Add into manager
@@ -675,10 +749,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="logging level (0=notset, 10=debug, 20=info...)",
     )
     p.add_argument(
-        "--seed", 
-        type=int, 
-        default=None, 
+        "--seed",
+        type=int,
+        default=None,
         help="Seed for generating random initial camera extrinsics. If None, uses config."
+    )
+    p.add_argument(
+        "--debug_dir",
+        type=str,
+        default="output/debug",
+        help="Directory to save per-step debug visualisation strips (RGB|Depth|DF|FT|Gain). "
+             "Set to empty string to disable.",
     )
     return p
 

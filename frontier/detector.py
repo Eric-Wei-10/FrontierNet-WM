@@ -1,11 +1,10 @@
 import numpy as np
 import torch
+import cv2
 import hdbscan
 import logging
 from typing import Optional, List, Any, Tuple
 
-from frontier.model.utils.postprocess import prediction2frontiermap
-from frontier.model.utils.preprocess import preprocess
 from frontier.model.predict import predict_from_img
 from frontier.frontier import Frontier
 from frontier.base import Base
@@ -59,43 +58,103 @@ class FrontierDetector(Base):
         self.extrinsic: Optional[np.ndarray] = None
 
         # outputs
-        self.df: Optional[np.ndarray] = None  # distance field
+        self.df_raw: Optional[np.ndarray] = None  # distance field, frame-48 coordinates
+        self.df: Optional[np.ndarray] = None  # distance field, projected to frame-0
         self.ft_region: Optional[np.ndarray] = None  # frontier region mask
         self.info_gain: Optional[np.ndarray] = None
         self.ft_3D: Optional[np.ndarray] = None  # 3D frontier clusters
 
     def _cal_processed_intrinsic(self, input_img_size):
         """
-        calculate new intrinsic matrix after preprocessing
-        which includes scalling and center cropping
-        specifically:
-            f' = f * scale_factor, c' = c * scale_factor
-            cx'' = cx' - delta_x and cy'' = cy' - delta_y
+        Calculate new intrinsic matrix after direct resize to model input size.
+
+        The training pipeline resizes the full image to (model_H, model_W) without
+        any center crop, so the correct transform is a simple per-axis scale:
+            fx' = fx * model_W / W_in
+            cx' = cx * model_W / W_in
+            fy' = fy * model_H / H_in
+            cy' = cy * model_H / H_in
+
+        img_size_model convention: (height, width) — consistent with get_ft_feature.
         """
         W, H = input_img_size
-        model_W, model_H = self.img_size_model
+        model_H, model_W = self.img_size_model  # (height, width)
 
-        # scaled image dims
-        scaled_W, scaled_H = self.scale_factor * W, self.scale_factor * H
+        K = self.ori_intrin.copy().astype(float)
+        K[0, 0] *= model_W / W   # fx
+        K[0, 2] *= model_W / W   # cx
+        K[1, 1] *= model_H / H   # fy
+        K[1, 2] *= model_H / H   # cy
 
-        # cropping offsets
-        offset_x = (scaled_W - model_W) / 2
-        offset_y = (scaled_H - model_H) / 2
-
-        # compute new intrinsic matrix
-        K = self.ori_intrin * self.scale_factor
-        K[0, 2] -= offset_x
-        K[1, 2] -= offset_y
-
-        # cache and return
         self.pro_intrin = K
+
+    def _project_frame48_to_frame0(
+        self,
+        value_map: np.ndarray,
+        depth: np.ndarray,
+        forward_dist: float = 1.0,
+        interpolation: int = cv2.INTER_LINEAR,
+    ) -> np.ndarray:
+        """
+        Project a value map from frame-48 coordinates back to frame-0 coordinates.
+
+        The model predicts for frame 48, which corresponds to the camera having moved
+        forward ``forward_dist`` metres along its +Z axis (fps=24, speed=0.5 m/s →
+        1 m over 48 frames).  For each pixel (u, v) in frame 0 with depth z we:
+
+          1. Unproject to 3-D in camera-0 frame:
+                 P = [(u-cx)/fx * z,  (v-cy)/fy * z,  z]
+          2. Express in camera-48 frame  (camera moved +Z by forward_dist):
+                 P' = P - [0, 0, forward_dist]
+          3. Project onto the frame-48 image plane:
+                 u' = fx * P'x / P'z + cx,   v' = fy * P'y / P'z + cy
+          4. Sample value_map at (u', v').
+
+        Args:
+            value_map:    (H, W) float array — model output at frame 48.
+            depth:        (H, W) float array — metric depth at frame 0 (preprocessed).
+            forward_dist: Camera displacement along +Z in metres (default 1.0).
+            interpolation: cv2 interpolation flag (default cv2.INTER_LINEAR).
+
+        Returns:
+            projected: (H, W) array — value map projected to frame-0 coordinates.
+        """
+        H, W = value_map.shape
+        K = self.pro_intrin
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        # pixel-coordinate grids for frame 0
+        u_grid, v_grid = np.meshgrid(
+            np.arange(W, dtype=np.float32),
+            np.arange(H, dtype=np.float32),
+        )
+
+        z0 = depth.astype(np.float32)
+        x_cam = (u_grid - cx) * z0 / fx   # X in camera-0 frame
+        y_cam = (v_grid - cy) * z0 / fy   # Y in camera-0 frame
+        z48 = z0 - forward_dist            # Z in camera-48 frame
+
+        # only pixels whose depth is positive in camera-48 are projectable
+        valid = z48 > 0
+        map_x = np.where(valid, fx * x_cam / z48 + cx, -1.0).astype(np.float32)
+        map_y = np.where(valid, fy * y_cam / z48 + cy, -1.0).astype(np.float32)
+
+        projected = cv2.remap(
+            value_map.astype(np.float32),
+            map_x,
+            map_y,
+            interpolation=interpolation,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        return projected
 
     def detect(
         self,
         rgb: np.ndarray,
         depth: np.ndarray,
-        df_normalizer: float = 3.0,
         df_thr: float = 0.1,
+        **kwargs,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Run frontier detection on an RGB + depth pair.
@@ -126,20 +185,78 @@ class FrontierDetector(Base):
             use_depth=self.use_depth,
             input_img_size=self.img_size_model,
         )
-        self.df = df_tensor.cpu().detach().numpy().squeeze()
-        self.logger.debug("Inference complete; DF shape: %s", self.df.shape)
+        # DepthEstimationModel returns df_tensor of shape [1, 1, H, W] (single channel).
+        self.df_raw = df_tensor.cpu().detach().numpy().squeeze()  # -> [H, W], frame-48 coords
+        self.df = self.df_raw  # will be overwritten with projected version below
+        self.logger.info(
+            "Inference complete; interest map shape: %s  raw stats: min=%.3f  max=%.3f  mean=%.3f",
+            self.df_raw.shape, self.df_raw.min(), self.df_raw.max(), self.df_raw.mean(),
+        )
+
+        # --- 1.5) Project frame-48 outputs → frame-0 coordinates ---
+        # The model was trained to predict for the view 48 frames ahead
+        # (fps=24, speed=0.5 m/s → 1 m forward along camera +Z).
+        # Resize depth to model input size using the same direct-resize strategy
+        # as the training pipeline (no center crop).
+        model_H, model_W = self.img_size_model
+        depth_proc = cv2.resize(
+            depth.astype(np.float32), (model_W, model_H), interpolation=cv2.INTER_LINEAR
+        )
+
+        self.logger.info("Projecting frame-48 outputs to frame-0 coordinates...")
+        self.df = self._project_frame48_to_frame0(self.df_raw, depth_proc)
+        self.logger.info(
+            "Projected DF stats: min=%.3f  max=%.3f  mean=%.3f  "
+            ">3.51 (frontier threshold): %.1f%%  "
+            "valid pixels (depth>1m): %.1f%%",
+            self.df.min(),
+            self.df.max(),
+            self.df.mean(),
+            100.0 * (self.df > 3.51).mean(),
+            100.0 * (depth_proc > 1.0).mean(),
+        )
+
+        # Project each channel of the classification logits independently.
+        cls_np = cls_mask.cpu().numpy()  # [1, n_classes, H, W]
+        projected_channels = np.stack(
+            [
+                self._project_frame48_to_frame0(cls_np[0, c], depth_proc)
+                for c in range(cls_np.shape[1])
+            ],
+            axis=0,
+        )[np.newaxis]  # [1, n_classes, H, W]
+        cls_mask = torch.from_numpy(projected_channels).to(device=cls_mask.device, dtype=cls_mask.dtype)
+
+        df_tensor = torch.from_numpy(self.df)
 
         # --- 2) Postprocessing ---
-        self.logger.debug(
-            "Postprocessing: normalizer=%.2f, threshold=%.2f", df_normalizer, df_thr
+        # The model outputs a [0, 1] interest map (IDP), NOT a normalize_df-encoded distance
+        # field. The original prediction2frontiermap pipeline (denormalize_df + threshold)
+        # would require outputs > 3.51, which the model never reaches. Instead:
+        #
+        #   ft_region  — direct threshold on the projected interest map
+        #   info_gain  — segment class → interest midpoint, scaled for get_3D_ft_clusters
+        #
+        # Segmentation bin edges used during training: (0.05, 0.15, 0.3, 0.45, 0.6, 0.8)
+        # partitioning [0, 1] interest into 7 classes (0 = low/invalid, 6 = highest).
+        # get_3D_ft_clusters applies an internal *0.01 factor; scaling gain_map by 1000
+        # maps interest > 0.1 → final gain > 1, which passes filter_min_gain=1 in config.
+
+        interest_np = self.df  # projected [H, W], values in [0, 1]
+        self.ft_region = (interest_np > df_thr).astype(np.float32)
+        self.logger.info(
+            "Postprocessing: interest threshold=%.2f, frontier pixels=%.1f%%",
+            df_thr, 100.0 * self.ft_region.mean(),
         )
-        self.ft_region, self.info_gain = prediction2frontiermap(
-            df=df_tensor,
-            cls_mask=cls_mask,
-            n_classes=self.model.n_classes,
-            df_normalizer=df_normalizer,
-            threshold=df_thr,
+
+        _seg_edges = [0.0, 0.05, 0.15, 0.3, 0.45, 0.6, 0.8, 1.0]
+        _bin_midpoints = np.array(
+            [(_seg_edges[i] + _seg_edges[i + 1]) / 2.0 for i in range(len(_seg_edges) - 1)],
+            dtype=np.float32,
         )
+        cls_label = cls_mask.argmax(dim=1).squeeze().cpu().numpy()  # [H, W], labels 0-6
+        gain_map = _bin_midpoints[cls_label]  # each pixel → midpoint interest value
+        self.info_gain = np.where(self.ft_region > 0, gain_map * 1000.0, 0.0)
 
         return self.ft_region, self.info_gain
 
@@ -149,14 +266,11 @@ class FrontierDetector(Base):
         """
         Anchoring 2D Frontiers to 3D Frontier Clusters using depth and camera extrinsics.
         """
-        # 1) Preprocess depth (resize + center crop)
-        depth = preprocess(
-            depth,
-            self.scale_factor,
-            *self.img_size_model,
-            is_depth=True,
-            normalize_depth=False,
-        ).squeeze()
+        # 1) Resize depth to model input size (direct resize, matching training pipeline)
+        model_H, model_W = self.img_size_model
+        depth = cv2.resize(
+            depth.astype(np.float32), (model_W, model_H), interpolation=cv2.INTER_LINEAR
+        )
         self.extrinsic = extrinsic
 
         # 2) Validate shapes: ft_region and depth should align
