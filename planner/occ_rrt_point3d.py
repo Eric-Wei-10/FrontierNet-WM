@@ -42,7 +42,7 @@ class OccupancyGrid3DPathPlanner:
         self.ss = og.SimpleSetup(self.sp)
         self.ss.setStateValidityChecker(ob.StateValidityCheckerFn(self.is_state_valid))
         self.sp.setup()
-        self.ss.getSpaceInformation().setStateValidityCheckingResolution(0.01)
+        self.ss.getSpaceInformation().setStateValidityCheckingResolution(0.003)
         self.solution: List[Dict[str, np.ndarray]] = []
 
     @property

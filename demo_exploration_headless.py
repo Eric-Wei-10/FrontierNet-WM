@@ -4,16 +4,22 @@ This version does not require a display and can run on clusters without monitors
 """
 
 import os
+import shutil
 import time
 import logging
 import argparse
+from collections import deque
 from typing import Optional, List, Tuple
 from pathlib import Path
 import numpy as np
 import torch
 import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import open3d as o3d
 import open3d.visualization.rendering as rendering
+from PIL import Image as _PILImage
 
 from utils.vis_utils import (
     create_camera,
@@ -132,10 +138,11 @@ class HeadlessRenderer:
 
     def cleanup(self):
         """Clean up renderer resources."""
-        try:
-            self.renderer.scene.clear_geometry()
-        except Exception:
-            pass
+        # Do NOT call clear_geometry() — it releases Filament GPU resources and
+        # then the OffscreenRenderer destructor tries to free them again, causing
+        # the "nonexistent resource" crash.  Setting to None destroys everything
+        # in one shot through Filament's own destructor.
+        self.renderer = None
 
     def _setup_camera(self):
         """Setup camera with current intrinsic and extrinsic."""
@@ -176,7 +183,11 @@ class HeadlessRenderer:
             RGB image as numpy array (H, W, 3) with values in [0, 255].
         """
         img = self.renderer.render_to_image()
-        return np.asarray(img)
+        rgb = np.asarray(img)
+        # Stretch to model input size (540→544) using LANCZOS, matching gen3c_frontier.py
+        pil_img = _PILImage.fromarray(rgb)
+        pil_img = pil_img.resize((self.width, HeadlessExplorerApp.MODEL_H), _PILImage.LANCZOS)
+        return np.asarray(pil_img)
 
     def capture_depth(self) -> np.ndarray:
         """
@@ -188,10 +199,10 @@ class HeadlessRenderer:
         # z_in_view_space=True gives us actual depth values (distance from camera)
         depth_img = self.renderer.render_to_depth_image(z_in_view_space=True)
         depth = np.asarray(depth_img).astype(np.float32)
-        
+
         # Replace inf values (background/sky) with 0
         depth[~np.isfinite(depth)] = 0.0
-        
+
         return depth
 
     def capture_rgbd(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -216,7 +227,9 @@ class HeadlessExplorerApp:
     VOX_SIZE = 0.1
 
     # Camera (robot) defaults
-    CAM_H, CAM_W, CAM_F = 480, 480, 300.0
+    CAM_H, CAM_W, CAM_F = 540, 720, 300.0
+    # Model input height — rendered at CAM_H=540 then stretched to match training
+    MODEL_H = 544
 
     # Depth sources
     DEPTH_GT = "GT"
@@ -228,7 +241,7 @@ class HeadlessExplorerApp:
 
         # Config
         self.config = read_config_yaml(args.config)
-        self.predict_interval: int = int(self.config.get("predict_interval", 5))
+        self.detect_interval: int = int(self.config.get("detect_interval", 10))
         self.plan_interval: int = int(self.config.get("plan_interval", 10))
 
         # Depth source
@@ -252,13 +265,27 @@ class HeadlessExplorerApp:
         self.move_enough: bool = True
         self.last_W_T_C: np.ndarray = np.eye(4)  # camera pose
 
+        # Stuck detection: drop the current frontier if the robot's cumulative
+        # path length over the last N steps is below a threshold, indicating it
+        # is physically blocked (e.g. against a wall).
+        self._stuck_window: int = 5              # number of recent steps to inspect
+        self._stuck_disp_threshold: float = 0.3  # metres — min cumulative path length
+        self._recent_positions: deque = deque(maxlen=self._stuck_window + 1)
+
         # JSON output
         save_dir = os.path.join(os.path.dirname(__file__), "output")
         os.makedirs(save_dir, exist_ok=True)
         self.json_path: str = args.write_path or None
+        # make parent dir
+        os.makedirs(os.path.dirname(self.json_path), exist_ok=True)
 
-        # Debug visualisation (empty string → disabled)
-        self.debug_dir: Optional[str] = args.debug_dir or None
+        # Debug visualisation — default to <json_parent>/debug if not explicitly set
+        if args.debug_dir:
+            self.debug_dir: Optional[str] = args.debug_dir
+        elif self.json_path:
+            self.debug_dir = os.path.join(os.path.dirname(self.json_path), "debug")
+        else:
+            self.debug_dir = None
         self._debug_step: int = 0
 
     # ---------- RGBD capture ----------
@@ -342,9 +369,13 @@ class HeadlessExplorerApp:
         if det.raw_depth is not None:
             panels.append(add_label(resize_h(to_colormap(det.raw_depth), PANEL_H), "Depth"))
 
-        # 3a. Raw Distance Field (frame-48 coordinates, before projection)
+        # 3a. Raw Distance Field — original model output before disocclusion redistribution
+        if det.df_raw_pre_redist is not None:
+            panels.append(add_label(resize_h(to_colormap(det.df_raw_pre_redist), PANEL_H), "DF raw (pre-redist.)"))
+
+        # 3b. Raw Distance Field — after scattering disocclusion values to visible edge pixels
         if det.df_raw is not None:
-            panels.append(add_label(resize_h(to_colormap(det.df_raw), PANEL_H), "DF raw (frame-48)"))
+            panels.append(add_label(resize_h(to_colormap(det.df_raw), PANEL_H), "DF raw (post-redist.)"))
 
         # 3b. Distance Field projected to frame-0
         if det.df is not None:
@@ -359,6 +390,17 @@ class HeadlessExplorerApp:
         if det.info_gain is not None:
             panels.append(add_label(resize_h(to_colormap(det.info_gain), PANEL_H), "Info Gain"))
 
+        # 6. Newly visible at frame-48 — use the disocclusion mask that was already
+        #    computed (with the corrected bilinear-neighbour + dilation coverage) by
+        #    _redistribute_disocclusion_values, so the panel and the redistribution
+        #    always agree on which pixels are disocclusion.
+        if det.disocclusion_mask is not None:
+            newly_visible = (det.disocclusion_mask * 255).astype(np.uint8)
+            panels.append(add_label(
+                resize_h(cv2.cvtColor(newly_visible, cv2.COLOR_GRAY2BGR), PANEL_H),
+                "New@frame-48 (disoccl.)",
+            ))
+
         if not panels:
             return
 
@@ -367,6 +409,96 @@ class HeadlessExplorerApp:
         out_path = os.path.join(self.debug_dir, f"step_{self._debug_step:04d}.png")
         cv2.imwrite(out_path, strip)
         logging.info("Saved debug image: %s", out_path)
+        self._debug_step += 1
+
+    def _save_debug_image_detr(self) -> None:
+        """
+        Save a debug image for the DETR mode (matplotlib style, matching plot_detr_predictions):
+          lime × = visible [DISC], red × = occluded [PRIO]
+          Labels show normalised uv, z, weight, confidence, and occlusion probability.
+        """
+        if self.debug_dir is None or self.ft_detector is None:
+            return
+
+        det = self.ft_detector
+        if det.raw_rgb is None:
+            return
+
+        slots     = getattr(det, "detr_slots", [])
+        n_visible  = sum(1 for s in slots if not s.get("is_occluded", False))
+        n_occluded = sum(1 for s in slots if s.get("is_occluded", False))
+
+        model_H, model_W = det.img_size_model
+        img_np   = det.raw_rgb[..., :3].astype(np.float32) / 255.0
+        orig_H, orig_W = img_np.shape[:2]
+        scale_x  = orig_W / model_W
+        scale_y  = orig_H / model_H
+
+        fig, ax = plt.subplots(1, 1, figsize=(10, 7))
+        ax.imshow(img_np)
+
+        # Camera info (top-left corner)
+        cam_pos  = getattr(det, "_detr_cam_pos", None)
+        cam_disp = getattr(det, "_detr_cam_displacement", None)
+        if cam_pos is not None:
+            info_str = (
+                f"step {self._debug_step}  "
+                f"cam ({cam_pos[0]:.2f}, {cam_pos[1]:.2f}, {cam_pos[2]:.2f})  "
+                f"moved {cam_disp:.3f} m"
+            )
+            ax.text(6, 20, info_str, color="cyan", fontsize=7,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5))
+
+        for s in slots:
+            u_px   = s["u_px"] * scale_x
+            v_px   = s["v_px"] * scale_y
+            is_occ = s.get("is_occluded", False)
+            color  = "red" if is_occ else "lime"
+
+            ax.scatter(u_px, v_px, s=120, c=color, marker="o", linewidths=2)
+
+            raw_w  = s.get("weight_raw", s["weight"])
+            eff_w  = s["weight"]
+            u_norm = s["u_px"] / model_W
+            v_norm = s["v_px"] / model_H
+            label  = (
+                f"uv=({u_norm:.2f},{v_norm:.2f})  z={s['z']:.1f}m\n"
+                f"w={raw_w:.2f}→{eff_w:.2f}  c={s['conf']:.2f}  occ={s['occ']:.2f}"
+            )
+            ax.annotate(label, xy=(u_px, v_px), xytext=(4, 6),
+                        textcoords="offset points", color=color, fontsize=7,
+                        bbox=dict(boxstyle="round,pad=0.1", fc="black", alpha=0.4))
+
+        ax.axis("off")
+        ax.set_title(
+            f"DETR: lime×=visible  red×=occluded  "
+            f"occluded={n_occluded}  visible={n_visible}"
+        )
+        plt.tight_layout()
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        img_rgb = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[..., :3]
+        plt.close(fig)
+
+        panels = [img_rgb]
+
+        # Auxiliary depth panel (if available) — colourised, height-matched
+        depth_pred = getattr(det, "detr_depth_pred", None)
+        if depth_pred is not None:
+            d = depth_pred.astype(np.float32)
+            mn, mx = d.min(), d.max()
+            normed = ((d - mn) / max(mx - mn, 1e-6) * 255).astype(np.uint8)
+            depth_rgb = cv2.cvtColor(cv2.applyColorMap(normed, cv2.COLORMAP_PLASMA),
+                                     cv2.COLOR_BGR2RGB)
+            ph, dh, dw = img_rgb.shape[0], *depth_rgb.shape[:2]
+            depth_rgb = cv2.resize(depth_rgb, (max(1, int(dw * ph / dh)), ph))
+            panels.append(depth_rgb)
+
+        strip = np.hstack(panels)
+        os.makedirs(self.debug_dir, exist_ok=True)
+        out_path = os.path.join(self.debug_dir, f"step_{self._debug_step:04d}.png")
+        cv2.imwrite(out_path, cv2.cvtColor(strip, cv2.COLOR_RGB2BGR))
+        logging.info("Saved DETR debug image: %s", out_path)
         self._debug_step += 1
 
     # ---------- main exploration logic ----------
@@ -414,33 +546,74 @@ class HeadlessExplorerApp:
                 break
 
             no_more_frontier = (
-                len(self.ft_manager.valid_frontiers) == 0 and n_robot_poses > 10
+                len(self.ft_manager.valid_frontiers) == 0 and n_robot_poses >= 1
             )
-            reach_next_update = len(self.path_to_go) == 0 or (
-                (n_robot_poses - 1) % self.predict_interval == 0
+            # Detection runs on a fixed interval (or when the frontier list is empty).
+            # Kept separate from replanning so the model doesn't run every step
+            # just because the current path was short.
+            should_detect = no_more_frontier or (
+                n_robot_poses % self.detect_interval == 0
             )
+            # Replanning runs whenever the path is exhausted OR detection just
+            # added new frontiers (so the planner can consider them immediately).
+            should_replan = not self.path_to_go or should_detect
 
-            if no_more_frontier or reach_next_update:
-                logging.info("Updating frontiers.")
-                # New observation
+            if should_detect:
+                logging.info("Running frontier detection (step %d).", n_robot_poses)
                 rgb, depth = self.get_rgbd()
 
-                # Frontier detection + anchoring
-                self.ft_detector.detect(
-                    rgb=rgb,
-                    depth=depth,
-                    df_normalizer=self.config["df_normalizer"],
-                    df_thr=self.config["df_thr"],
-                )
-                self._save_debug_image()
-                ft_list = self.ft_detector.anchor_fts(depth=depth, extrinsic=C_T_W)
+                # Frontier detection — branch on model type
+                if self.args.model_type == "detr_unet":
+                    # DETR: goals are (u,v,z) 3-D points; GMM weight = info-gain proxy.
+                    # Occluded goals are handled transparently by the path planner.
+                    ft_list = self.ft_detector.detect_detr(
+                        rgb=rgb,
+                        extrinsic=C_T_W,
+                        conf_thresh=self.args.detr_conf_thresh,
+                        gain_scale=self.args.detr_gain_scale,
+                        visible_gain_discount=self.args.detr_visible_gain_discount,
+                    )
+                    self._save_debug_image_detr()
+                else:
+                    # Dense DPT/UNet pipeline
+                    self.ft_detector.detect(
+                        rgb=rgb,
+                        depth=depth,
+                        df_thr=self.config["df_thr"],
+                    )
+                    self._save_debug_image()
+                    ft_list = self.ft_detector.anchor_fts(depth=depth, extrinsic=C_T_W)
+
+                # Clamp frontier z to planning bounds [z_min, z_max]
+                if ft_list and self.config.get("bounds") is not None:
+                    z_min = float(self.config["bounds"][4])
+                    z_max = float(self.config["bounds"][5])
+                    for ft in ft_list:
+                        ft.pos3d[2] = float(np.clip(ft.pos3d[2], z_min, z_max))
 
                 # Add into manager
                 if ft_list:
-                    new_ids = self.ft_manager.add_robot_poses([W_T_C])
-                    self.ft_manager.add_frontiers(frontiers=ft_list, parent_ids=new_ids)
-                    self.ft_manager.filter_frontiers()
-                    self.ft_manager.gain_adjustment()
+                    if self.args.model_type == "detr_unet":
+                        ft_list = self.ft_manager.dedup_new_frontiers(
+                            ft_list, radius=self.args.detr_dedup_radius
+                        )
+                    # Reuse the most recent robot pose if the robot hasn't moved
+                    # since it was recorded, to avoid creating duplicate graph nodes
+                    # at the same position every detection cycle.
+                    cur_pos = W_T_C[:3, 3]
+                    last_rid = self.ft_manager.current_robot_id
+                    last_pose = (
+                        self.ft_manager.robot_poses.get(last_rid)
+                        if last_rid is not None else None
+                    )
+                    if (
+                        last_pose is not None
+                        and float(np.linalg.norm(cur_pos - last_pose[:3, 3])) < 0.1
+                    ):
+                        parent_ids = [last_rid]
+                    else:
+                        parent_ids = self.ft_manager.add_robot_poses([W_T_C])
+                    self.ft_manager.add_frontiers(frontiers=ft_list, parent_ids=parent_ids)
                     self.ft_manager.filter_frontiers()
 
                 if len(self.ft_manager.valid_frontiers) == 0:
@@ -453,14 +626,17 @@ class HeadlessExplorerApp:
 
             og = self.mapper.get_occupancy_grid()
             self.ft_manager.update_map(free_map=og["free"], occ_map=og["occupied"])
-            self.ft_manager.gain_adjustment()
+            if self.args.model_type == "detr_unet":
+                self.ft_manager.gain_adjustment_detr()
+            else:
+                self.ft_manager.gain_adjustment()
             self.ft_manager.filter_frontiers()
             self.ft_manager.merge_frontiers()
             self.ft_manager.filter_frontiers()
             self.ft_manager.update_utility(current_pos=W_T_C[:3, 3])
 
             # Replan if needed
-            if reach_next_update and self.move_enough:
+            if should_replan and (self.move_enough or not self.path_to_go):
                 logging.info("Replanning...")
                 logging.debug(f"Replanning (interval={self.plan_interval}).")
                 self.path_to_go = self.ft_manager.plan_path_to_goal(W_T_C) or []
@@ -471,8 +647,18 @@ class HeadlessExplorerApp:
                     self.move_enough = False
                 else:
                     logging.warning("No path found, deleting current goal frontier.")
+                    self._recent_positions.clear()
                     self.path_to_go = []
                     self.move_enough = True  # try again next cycle
+
+            # Safety termination: if there is nothing to navigate toward and no
+            # frontiers remain (e.g. all dropped by filter or stuck-detection),
+            # stop rather than spinning until max_time_s.
+            if not self.path_to_go and len(self.ft_manager.valid_frontiers) == 0:
+                logging.info(
+                    "No valid frontiers and no active path — exploration finished."
+                )
+                break
 
             # Persist state snapshot
             if self.json_path:
@@ -483,6 +669,30 @@ class HeadlessExplorerApp:
             if self.path_to_go:
                 logging.debug("Moving along the path.")
                 self.move(steps=1)
+
+            # Stuck detection: record current position and check cumulative
+            # path length over the last _stuck_window steps.  If the robot
+            # has barely moved, the current goal is unreachable — drop it.
+            self._recent_positions.append(W_T_C[:3, 3].copy())
+            if len(self._recent_positions) == self._recent_positions.maxlen:
+                pts = list(self._recent_positions)
+                cumulative = sum(
+                    float(np.linalg.norm(pts[i + 1] - pts[i]))
+                    for i in range(len(pts) - 1)
+                )
+                if cumulative < self._stuck_disp_threshold:
+                    goal_id = self.ft_manager.current_goal_ft_id
+                    if goal_id is not None:
+                        logging.warning(
+                            "Stuck detected: cumulative displacement %.2f m over %d steps "
+                            "< %.2f m — dropping frontier %s.",
+                            cumulative, self._stuck_window,
+                            self._stuck_disp_threshold, goal_id,
+                        )
+                        self.ft_manager.remove_frontiers([goal_id])
+                        self._recent_positions.clear()
+                        self.path_to_go = []
+                        self.move_enough = True
 
         # Final state output
         logging.info("Exploration finished, total steps: %d", n_robot_poses)
@@ -567,11 +777,14 @@ class HeadlessExplorerApp:
             initial_C_T_W = np.asarray(self.config["initial_cam_extrinsic"], dtype=float)
             
         self.renderer.set_extrinsic(initial_C_T_W)
-        # rgb, depth0 = self.get_rgbd()
-        # import matplotlib.pyplot as plt
-        # plt.imsave('initial_view_1.png', rgb)
+
+        # Save starting pose RGB for manual inspection
+        _start_rgb = self.renderer.capture_rgb()
+        _start_path = os.path.join(os.path.dirname(__file__), "visualize", "starting_pose.png")
+        cv2.imwrite(_start_path, cv2.cvtColor(_start_rgb, cv2.COLOR_RGB2BGR))
         # import pdb; pdb.set_trace()
-        
+        logging.info("Saved starting pose image: %s", _start_path)
+
         self.last_W_T_C = np.linalg.inv(initial_C_T_W)
 
         # Mapper
@@ -595,19 +808,34 @@ class HeadlessExplorerApp:
         self.mapper = WaveMapper(params=params)
 
         # FrontierNet
-        unet = load_model(
+        model_type = self.args.model_type
+        use_depth = True
+        feature_layers = (
+            [int(x) for x in self.args.vit_feature_layers.split(",")]
+            if self.args.vit_feature_layers
+            else None
+        )
+        net = load_model(
             path=self.args.unet_weight,
             num_classes=self.config["num_classes"],
-            use_depth=True,
+            use_depth=use_depth,
+            model_type=model_type,
+            vit_depth=self.args.vit_depth,
+            feature_layers=feature_layers,
+            num_queries=self.args.detr_num_queries,
+            detr_aux_depth=self.args.detr_aux_depth,
         )
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.ft_detector = FrontierDetector(
-            model=unet,
+            model=net,
             camera_intrinsic=intr.intrinsic_matrix.copy(),
-            use_depth=True,
+            use_depth=use_depth,
             img_size_model=self.config["input_img_size"],
             device=device,
             log_level=self.args.log_level,
+            model_type=model_type,
+            disocclusion_only=self.args.disocclusion_only,
+            edge_spread_width=self.args.edge_spread_width,
         )
 
         # Frontier Manager
@@ -615,19 +843,16 @@ class HeadlessExplorerApp:
             params=self.config, log_level=self.args.log_level
         )
 
+        # Wipe and recreate the output directory so each run starts clean
+        # (prevents multiple runs from being concatenated into the same JSON).
+        if self.json_path:
+            out_dir = os.path.dirname(self.json_path)
+            if os.path.exists(out_dir):
+                shutil.rmtree(out_dir)
+            os.makedirs(out_dir, exist_ok=True)
+
         logging.info("Headless system setup complete.")
 
-    # def cleanup(self) -> None:
-    #     """Clean up resources to avoid memory issues on exit."""
-    #     # Explicitly delete renderer to clean up GPU resources before exit
-    #     if self.renderer is not None:
-    #         self.renderer.cleanup()
-    #         del self.renderer.renderer
-    #         del self.renderer
-    #         self.renderer = None
-    #     # Force garbage collection
-    #     import gc
-    #     gc.collect()
     
     def cleanup(self) -> None:
         """Clean up resources safely."""
@@ -728,7 +953,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--unet_weight",
         type=Path,
         default=Path("model_weights/rgbd_11cls.pth"),
-        help="Path to UNet model weights",
+        help="Path to model weights (UNet or DPT checkpoint)",
+    )
+    p.add_argument(
+        "--model_type",
+        type=str,
+        default="dpt",
+        choices=["dpt", "unet", "detr_unet"],
+        help=(
+            "Model architecture: "
+            "'dpt' (ViT+DPT, RGB-only, dense df_seg head), "
+            "'unet' (ResNet34+UNet, RGB-D, dense df_seg head), "
+            "'detr_unet' (ResNet34+UNet, RGB-only, sparse DETR head — "
+            "goals parameterised as (u,v,z) 3-D points, GMM weight = info-gain proxy)"
+        ),
+    )
+    p.add_argument(
+        "--vit_depth",
+        type=int,
+        default=6,
+        help="(DPT only) Number of ViT transformer layers used during training",
+    )
+    p.add_argument(
+        "--vit_feature_layers",
+        type=str,
+        default="3,4,5",
+        help="(DPT only) Comma-separated ViT layer indices used for DPT fusion, e.g. '4,5,6,7'. "
+             "Defaults to the last min(4, vit_depth) layers.",
     )
     p.add_argument(
         "--depth_source",
@@ -757,9 +1008,79 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--debug_dir",
         type=str,
-        default="output/debug",
+        default=None,
         help="Directory to save per-step debug visualisation strips (RGB|Depth|DF|FT|Gain). "
-             "Set to empty string to disable.",
+             "Defaults to <json_parent>/debug. Set to empty string to disable.",
+    )
+    p.add_argument(
+        "--disocclusion_only",
+        action="store_true",
+        default=False,
+        help="If set, df_raw post-redistribution contains only the pixels that received "
+             "contributions from disocclusion regions; all unmoved (originally covered) "
+             "pixels are zeroed out.",
+    )
+    p.add_argument(
+        "--edge_spread_width",
+        type=int,
+        default=15,
+        help="Width in pixels of the horizontal dilation applied to df_raw after "
+             "disocclusion redistribution (must be odd for symmetric spread; default 20).",
+    )
+    # --- DETR-specific args (detr_unet mode only) ---
+    p.add_argument(
+        "--detr_conf_thresh",
+        type=float,
+        default=0.3,
+        help="(detr_unet) Minimum slot confidence to accept as a frontier candidate.",
+    )
+    p.add_argument(
+        "--detr_num_queries",
+        type=int,
+        default=10,
+        help="(detr_unet) Number of DETR slot queries (must match the trained checkpoint).",
+    )
+    p.add_argument(
+        "--detr_aux_depth",
+        action="store_true",
+        default=False,
+        help=(
+            "(detr_unet) Set this flag when the checkpoint was trained with an "
+            "auxiliary dense depth supervision head (detr_aux_depth=True in "
+            "TwoHeadUnet). Must match the training configuration so the state-dict "
+            "keys align; also enables the aux-depth panel in debug images."
+        ),
+    )
+    p.add_argument(
+        "--detr_gain_scale",
+        type=float,
+        default=100.0,
+        help=(
+            "(detr_unet) Multiplicative scale applied to the raw GMM weight before "
+            "it is stored as frontier gain.  The dense pipeline produces gains in "
+            "[~1, 9] (midpoint × 10); set this so DETR weights pass filter_min_gain. "
+            "Default 10.0."
+        ),
+    )
+    p.add_argument(
+        "--detr_dedup_radius",
+        type=float,
+        default=0.5,
+        help=(
+            "(detr_unet) Exclusion radius in metres for cross-frame deduplication. "
+            "A newly detected frontier is dropped if any existing valid frontier "
+            "lies within this distance. Default 0.5 m."
+        ),
+    )
+    p.add_argument(
+        "--detr_visible_gain_discount",
+        type=float,
+        default=0.1,
+        help=(
+            "(detr_unet) Multiplicative discount applied to the gain of non-occluded "
+            "(already-visible) frontiers. Occluded frontiers keep their full gain so "
+            "the planner prefers exploring hidden/unseen areas. Default 0.1."
+        ),
     )
     return p
 

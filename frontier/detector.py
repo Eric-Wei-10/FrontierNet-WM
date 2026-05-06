@@ -26,21 +26,26 @@ class FrontierDetector(Base):
         img_size_model: Tuple[int, int] = (320, 320),
         device: str = "cuda",
         log_level: int = logging.INFO,
+        model_type: str = "dpt",
+        disocclusion_only: bool = False,
+        edge_spread_width: int = 20,
     ):
         """
         Args:
             model: the neural network or algorithm instance
             camera_intrinsic: original RGB camera intrinsic matrix
             use_depth: whether to use the depth image
-            img_size_model: (width, height) expected by the model
+            img_size_model: (height, width) expected by the model — index 0 is H, index 1 is W
             device: "cuda" or "cpu"
             log_level: logging level (e.g. logging.INFO)
+            model_type: "dpt" or "unet" — controls preprocessing in predict_from_img
         """
         # configure logging
         super().__init__(params=None, log_level=log_level)
 
         # core components
         self.model = model
+        self.model_type = model_type
         self.device = torch.device(device if device == "cuda" else "cpu")
 
         # intrinsics & preprocessing state
@@ -51,6 +56,8 @@ class FrontierDetector(Base):
 
         # modality flags
         self.use_depth: bool = use_depth
+        self.disocclusion_only: bool = disocclusion_only
+        self.edge_spread_width: int = edge_spread_width
 
         # inputs
         self.raw_rgb: Optional[np.ndarray] = None
@@ -58,7 +65,9 @@ class FrontierDetector(Base):
         self.extrinsic: Optional[np.ndarray] = None
 
         # outputs
-        self.df_raw: Optional[np.ndarray] = None  # distance field, frame-48 coordinates
+        self.df_raw: Optional[np.ndarray] = None  # distance field, frame-48 coords (after disocclusion redistribution)
+        self.df_raw_pre_redist: Optional[np.ndarray] = None  # df_raw before redistribution, for debug
+        self.disocclusion_mask: Optional[np.ndarray] = None  # bool (H,W) in frame-48 coords, True = disocclusion
         self.df: Optional[np.ndarray] = None  # distance field, projected to frame-0
         self.ft_region: Optional[np.ndarray] = None  # frontier region mask
         self.info_gain: Optional[np.ndarray] = None
@@ -87,6 +96,111 @@ class FrontierDetector(Base):
         K[1, 2] *= model_H / H   # cy
 
         self.pro_intrin = K
+
+    def _redistribute_disocclusion_values(
+        self,
+        df_raw: np.ndarray,
+        depth: np.ndarray,
+        forward_dist: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Redistribute df_raw values that fall in the disocclusion region onto the
+        nearest frame-48 pixel that IS covered by a frame-0 pixel.
+
+        The disocclusion region is the set of frame-48 pixels that no frame-0 pixel
+        forward-projects onto (i.e., coverage == 0 in the forward-warp map).
+        Those pixels carry genuine model predictions but are invisible from frame 0,
+        so the backward-warp in _project_frame48_to_frame0 never samples them.
+
+        For each disocclusion pixel p at distance d from the nearest covered pixel q:
+            df_out[q] += df_raw[p] * (1 / d)
+
+        Pixels exactly on the coverage boundary (d == 0) already belong to the
+        covered set and are never processed as disocclusion pixels.
+
+        After redistribution, all disocclusion pixels are zeroed so the returned
+        map only contains values at locations visible from frame 0.
+
+        Args:
+            df_raw:       (H, W) float array — raw model output in frame-48 coords.
+            depth:        (H, W) float array — metric depth at frame 0 (model-resized).
+            forward_dist: camera displacement along +Z in metres (default 1.0).
+
+        Returns:
+            df_out: (H, W) array — df_raw with disocclusion values scattered onto
+                    their nearest visible edge pixels and zeroed at disocclusion sites.
+        """
+        from scipy.ndimage import distance_transform_edt
+
+        H, W = df_raw.shape
+        K = self.pro_intrin
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        # --- build forward-warp coverage map ---
+        # For each frame-0 pixel (u, v, z), compute the float frame-48 coordinates
+        # (u48_f, v48_f) it projects to.  cv2.remap with INTER_LINEAR reads from all
+        # four bilinear-neighbour integer pixels around that float location, so we mark
+        # all four as covered.  A final 3×3 dilation closes any remaining sub-pixel
+        # gaps (e.g. when the depth is exactly an integer causing zero fractional part).
+        u_grid, v_grid = np.meshgrid(
+            np.arange(W, dtype=np.float32),
+            np.arange(H, dtype=np.float32),
+        )
+        z0 = depth.astype(np.float32)
+        z48 = z0 - forward_dist
+        valid = (z0 > 0) & (z48 > 0)
+
+        x_cam = (u_grid - cx) * z0 / fx
+        y_cam = (v_grid - cy) * z0 / fy
+        z48_safe = np.where(valid, z48, 1.0)  # avoid division by zero; invalid pixels masked by np.where
+        u48_f = np.where(valid, fx * x_cam / z48_safe + cx, -2.0)
+        v48_f = np.where(valid, fy * y_cam / z48_safe + cy, -2.0)
+
+        coverage = np.zeros((H, W), dtype=np.uint8)
+        # Mark all four bilinear neighbours (du, dv) ∈ {0,1}²
+        for du, dv in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            u48_i = np.floor(u48_f).astype(np.int32) + du
+            v48_i = np.floor(v48_f).astype(np.int32) + dv
+            m = valid & (u48_i >= 0) & (u48_i < W) & (v48_i >= 0) & (v48_i < H)
+            coverage[v48_i[m], u48_i[m]] = 1
+
+        # Small dilation to handle any residual sub-pixel gaps
+        coverage = cv2.dilate(coverage, np.ones((3, 3), np.uint8), iterations=1)
+        coverage_bool = coverage.astype(bool)
+
+        # Store for debug visualisation (updated each detect() call)
+        self.disocclusion_mask = ~coverage_bool
+
+        # --- for each uncovered pixel, find distance and coords of nearest covered pixel ---
+        uncovered = ~coverage_bool
+        dist, nearest_idx = distance_transform_edt(uncovered, return_indices=True)
+
+        disoccl_r, disoccl_c = np.where(uncovered)
+
+        df_out = df_raw.copy()
+        contribution = np.zeros_like(df_raw)
+        if disoccl_r.size > 0:
+            d = dist[disoccl_r, disoccl_c]                     # distance to nearest covered pixel
+            weights = np.where(d > 0, 1.0 / d, 1.0)           # 1/d weighting; d==0 shouldn't occur here
+            tgt_r = nearest_idx[0, disoccl_r, disoccl_c]
+            tgt_c = nearest_idx[1, disoccl_r, disoccl_c]
+
+            np.add.at(contribution, (tgt_r, tgt_c), df_raw[disoccl_r, disoccl_c] * weights)
+            df_out[disoccl_r, disoccl_c] = 0.0                 # zero out disocclusion sites
+            df_out += contribution
+
+        if self.disocclusion_only:
+            # Keep only the pixels that received redistributed contributions;
+            # all unmoved (originally covered) pixels are zeroed out.
+            df_out = contribution
+
+        self.logger.info(
+            "Disocclusion redistribution: %d pixels redistributed; "
+            "df_out stats: min=%.3f  max=%.3f  mean=%.3f",
+            disoccl_r.size,
+            df_out.min(), df_out.max(), df_out.mean(),
+        )
+        return df_out
 
     def _project_frame48_to_frame0(
         self,
@@ -154,7 +268,6 @@ class FrontierDetector(Base):
         rgb: np.ndarray,
         depth: np.ndarray,
         df_thr: float = 0.1,
-        **kwargs,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Run frontier detection on an RGB + depth pair.
@@ -184,6 +297,7 @@ class FrontierDetector(Base):
             scale_factor=self.scale_factor,
             use_depth=self.use_depth,
             input_img_size=self.img_size_model,
+            model_type=self.model_type,
         )
         # DepthEstimationModel returns df_tensor of shape [1, 1, H, W] (single channel).
         self.df_raw = df_tensor.cpu().detach().numpy().squeeze()  # -> [H, W], frame-48 coords
@@ -203,8 +317,16 @@ class FrontierDetector(Base):
             depth.astype(np.float32), (model_W, model_H), interpolation=cv2.INTER_LINEAR
         )
 
+        # --- 1.6) Redistribution disabled at inference time ---
+        # Disocclusion redistribution is now applied during training data preparation
+        # (data.py) so the model learns to fit redistributed targets directly.
+        self.df_raw_pre_redist = self.df_raw.copy()  # kept for debug panel consistency
+
         self.logger.info("Projecting frame-48 outputs to frame-0 coordinates...")
         self.df = self._project_frame48_to_frame0(self.df_raw, depth_proc)
+
+        
+
         self.logger.info(
             "Projected DF stats: min=%.3f  max=%.3f  mean=%.3f  "
             ">3.51 (frontier threshold): %.1f%%  "
@@ -305,6 +427,165 @@ class FrontierDetector(Base):
 
         self.ft_3D = frontiers
         return frontiers
+
+    def detect_detr(
+        self,
+        rgb: np.ndarray,
+        extrinsic: np.ndarray,
+        conf_thresh: float = 0.3,
+        gain_scale: float = 10.0,
+        visible_gain_discount: float = 0.1,
+    ) -> Optional[List[Frontier]]:
+        """
+        Run DETR-style frontier detection.
+
+        The model directly predicts a sparse set of N frontier candidates.  Each
+        candidate is parameterised by (u, v, z) — a 3-D point expressed as
+        normalised image coordinates plus metric depth — together with a GMM
+        component weight (proxy for information gain) and an occlusion flag.
+
+        Goals that are marked occluded are still returned as valid frontiers; the
+        downstream path planner handles navigation to goals that are not directly
+        visible in the current view.
+
+        Args:
+            rgb:         (H, W, 3) uint8 RGB image.
+            extrinsic:   4×4 C_T_W matrix (world-to-camera, i.e. inv(W_T_C)).
+            conf_thresh: Minimum slot confidence to accept (default 0.3).
+
+        Returns:
+            List of Frontier objects (one per accepted slot), or None if no
+            slots exceed the confidence threshold.
+        """
+        from frontier.model.predict import predict_detr_from_img
+
+        H, W = rgb.shape[:2]
+        # Compute scaled intrinsics for back-projection at model resolution
+        self._cal_processed_intrinsic((W, H))
+
+        # Log RGB statistics so we can verify the input changes between calls
+        rgb_f = rgb[..., :3].astype(np.float32)
+        self.logger.info(
+            "detect_detr input  cam_pos_world=(%.2f, %.2f, %.2f)  "
+            "rgb mean=%.3f  std=%.3f",
+            *np.linalg.inv(extrinsic)[:3, 3],
+            rgb_f.mean(), rgb_f.std(),
+        )
+
+        # --- Inference ---
+        uv_np, z_np, conf_np, weight_np, occ_np, depth_np = predict_detr_from_img(
+            net=self.model,
+            rgb_img=rgb,
+            device=self.device,
+            input_img_size=self.img_size_model,
+        )
+        # Store raw inputs and aux depth for debug visualisation
+        self.raw_rgb = rgb
+        self.detr_depth_pred: Optional[np.ndarray] = depth_np  # (model_H, model_W) or None
+
+        # Log raw model outputs — if UV never changes across steps the model is
+        # collapsing to fixed queries; if RGB changes but UV is static it is a
+        # model generalisation issue, not an exploration bug
+        self.logger.info(
+            "detect_detr raw uv_np (all slots):\n%s",
+            np.array2string(uv_np, precision=4, suppress_small=True),
+        )
+        self.logger.info(
+            "detect_detr z_np   : %s",
+            np.array2string(z_np, precision=3, suppress_small=True),
+        )
+        self.logger.info(
+            "detect_detr conf_np: %s",
+            np.array2string(conf_np, precision=3, suppress_small=True),
+        )
+
+        model_H, model_W = self.img_size_model
+        K = self.pro_intrin
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        # Camera centre in world frame (for view-direction computation + debug)
+        W_T_C = np.linalg.inv(extrinsic)
+        cam_pos_world = W_T_C[:3, 3]
+
+        # Track displacement between successive detect_detr calls for debug overlay
+        prev_pos = getattr(self, "_detr_last_cam_pos", None)
+        self._detr_cam_pos: np.ndarray = cam_pos_world.copy()
+        self._detr_cam_displacement: float = (
+            float(np.linalg.norm(cam_pos_world - prev_pos)) if prev_pos is not None else 0.0
+        )
+        self._detr_last_cam_pos = cam_pos_world.copy()
+
+        frontiers: List[Frontier] = []
+        self.detr_slots: List[dict] = []
+
+        for n in range(len(conf_np)):
+            if conf_np[n] < conf_thresh:
+                continue
+
+            # Pixel coordinates in model-input space
+            u_px = float(uv_np[n, 0]) * model_W   # column
+            v_px = float(uv_np[n, 1]) * model_H   # row
+            z = float(z_np[n])
+
+            if z <= 0.0:
+                continue
+
+            is_occluded = float(occ_np[n]) > 0.5
+
+            # Unproject to camera frame
+            x_cam = (u_px - cx) * z / fx
+            y_cam = (v_px - cy) * z / fy
+            cam_pt = np.array([x_cam, y_cam, z, 1.0])
+
+            # Transform to world frame
+            world_pt = (W_T_C @ cam_pt)[:3]
+
+            # View direction: camera centre → frontier point (unit vector)
+            vd = world_pt - cam_pos_world
+            vd_norm = np.linalg.norm(vd)
+            if vd_norm < 1e-6:
+                continue
+            vd = vd / vd_norm
+
+            # 2-D viewing angle in image plane (from principal point to slot pixel)
+            direct_angle = float(np.arctan2(v_px - cy, u_px - cx))
+
+            # Occluded frontiers are unexplored by definition and get full gain.
+            # Already-visible frontiers are partially known and receive a strong
+            # discount so the planner prefers occluded (hidden) goals.
+            base_gain = float(weight_np[n]) * gain_scale
+            effective_gain = base_gain if is_occluded else base_gain * visible_gain_discount
+
+            # Record for debug visualisation
+            self.detr_slots.append({
+                "u_px": u_px, "v_px": v_px,
+                "z": z, "conf": float(conf_np[n]),
+                "weight": effective_gain,
+                "weight_raw": float(weight_np[n]),
+                "occ": float(occ_np[n]),
+                "is_occluded": is_occluded,
+            })
+
+            f = Frontier()
+            f.pixel_pos = np.array([u_px, v_px])
+            f.direct_angle = direct_angle
+            f.gain = effective_gain
+            f.u_gain = effective_gain
+            f.pos3d = world_pt
+            f.view_direction = vd
+            f.set_valid()
+            frontiers.append(f)
+
+        n_occ = int(sum(s["is_occluded"] for s in self.detr_slots))
+        n_vis = len(self.detr_slots) - n_occ
+        self.ft_3D = frontiers if frontiers else None
+        self.logger.info(
+            "DETR detect: %d frontiers total  "
+            "(%d occluded/priority, %d visible/discounted, conf_thresh=%.2f, "
+            "visible_gain_discount=%.2f)",
+            len(frontiers), n_occ, n_vis, conf_thresh, visible_gain_discount,
+        )
+        return frontiers if frontiers else None
 
     def get_depth_feature(
         self, bin_mask: np.ndarray, depth: np.ndarray

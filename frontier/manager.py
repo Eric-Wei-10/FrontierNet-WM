@@ -80,6 +80,11 @@ class FrontierManager(Base):
         self.v_gain_reduction_factor = float(
             p.get("visited_gain_reduction_factor", 1000)
         )
+        # Multiplicative decay per close robot pose, used by gain_adjustment_detr().
+        # 0.5 means gain is halved for each previously visited nearby pose.
+        self.detr_v_gain_reduction_factor = float(
+            p.get("detr_visited_gain_reduction_factor", 0.5)
+        )
 
         # Rendering
         if p.get("render_K") is not None:
@@ -602,6 +607,110 @@ class FrontierManager(Base):
             "After gain adjustment: " + ", ".join(f"{ft.id}: {ft.u_gain}" for ft in fts)
         )
 
+    def gain_adjustment_detr(self) -> None:
+        """
+        Scale-agnostic history penalty for the DETR pipeline.
+
+        For each valid frontier, counts how many past robot poses lie within
+        (v_tras_thre, v_angl_thre) and applies an exponential multiplicative
+        decay controlled by detr_visited_gain_reduction_factor (default 0.5):
+
+            u_gain = max(gain * decay_factor ^ n_close, 1e-4)
+
+        Unlike the dense gain_adjustment(), this never subtracts a fixed
+        volume and therefore works regardless of the gain's unit or magnitude.
+        """
+        fts = self.valid_frontiers
+        if not fts:
+            return
+
+        robot_ids = self.graph.get_node_R()
+        if not robot_ids:
+            for ft in fts:
+                ft.u_gain = max(float(ft.gain) if ft.gain is not None else 1e-4, 1e-4)
+            return
+
+        ft_W_T_C = np.stack([ft.pose6d for ft in fts], axis=0)      # (N, 4, 4)
+        robot_W_T_R = np.stack(
+            [self.robot_poses[rid] for rid in robot_ids], axis=0
+        )                                                              # (M, 4, 4)
+
+        trans_diff, rot_diff = pose_difference(ft_W_T_C, robot_W_T_R)  # (N, M), (N, M)
+        close_mask = (trans_diff < self.v_tras_thre) & (rot_diff < self.v_angl_thre)
+        n_close = close_mask.sum(axis=1).astype(np.float32)            # (N,)
+
+        decay = float(self.detr_v_gain_reduction_factor)
+        for ft, nc in zip(fts, n_close):
+            base = float(ft.gain) if ft.gain is not None else 1e-4
+            ft.u_gain = max(base * (decay ** float(nc)), 1e-4)
+
+        self.logger.debug(
+            "DETR gain adjustment: decay=%.2f, n_close stats: min=%.0f max=%.0f",
+            decay, n_close.min(), n_close.max(),
+        )
+
+    def dedup_new_frontiers(
+        self, new_frontiers: List[Frontier], radius: float = 0.5
+    ) -> List[Frontier]:
+        """
+        Filter out frontiers whose 3-D position is within `radius` metres of
+        any existing valid frontier, to avoid adding near-duplicates across
+        detection intervals.
+
+        Args:
+            new_frontiers: Candidate Frontier objects (not yet added to the manager).
+            radius:        Exclusion radius in metres (default 0.5 m).
+
+        Returns:
+            Subset of new_frontiers that are sufficiently far from all existing
+            valid frontiers.
+        """
+        n_in = len(new_frontiers)
+
+        # Step 1: intra-batch dedup — remove frontiers within radius of an
+        # earlier frontier in the same detection batch.
+        batch_kept: List[Frontier] = []
+        batch_pos: List[np.ndarray] = []
+        for ft in new_frontiers:
+            pos = np.asarray(ft.pos3d, dtype=float)
+            if batch_pos:
+                nearest_in_batch = min(float(np.linalg.norm(pos - p)) for p in batch_pos)
+                if nearest_in_batch <= radius:
+                    self.logger.debug(
+                        "Intra-batch dedup at (%.2f, %.2f, %.2f): nearest %.3f m",
+                        *pos, nearest_in_batch,
+                    )
+                    continue
+            batch_kept.append(ft)
+            batch_pos.append(pos)
+
+        # Step 2: cross-frame dedup — remove frontiers within radius of any
+        # currently valid frontier from previous detection steps.
+        existing = self.valid_frontiers
+        if not existing:
+            kept = batch_kept
+        else:
+            existing_pos = np.array([ft.pos3d for ft in existing], dtype=float)
+            kept: List[Frontier] = []
+            for ft in batch_kept:
+                pos = np.asarray(ft.pos3d, dtype=float)
+                nearest = float(np.linalg.norm(existing_pos - pos, axis=1).min())
+                if nearest > radius:
+                    kept.append(ft)
+                else:
+                    self.logger.debug(
+                        "Cross-frame dedup at (%.2f, %.2f, %.2f): nearest existing %.3f m",
+                        *pos, nearest,
+                    )
+
+        n_dropped = n_in - len(kept)
+        if n_dropped:
+            self.logger.info(
+                "dedup_new_frontiers: dropped %d / %d (radius=%.2f m)",
+                n_dropped, n_in, radius,
+            )
+        return kept
+
     def update_utility(self, current_pos) -> None:
         """
         Update each valid frontier's utility (Eq.(8) in the paper):
@@ -643,6 +752,18 @@ class FrontierManager(Base):
         max_vd_z = self.filter_max_vd_z
         check_occ = self.occ_map is not None
 
+        n_before = sum(1 for ft in self.frontiers.values() if ft.is_valid)
+        self.logger.info(f"[filter] Start: {n_before} valid frontiers")
+        for fid, ft in self.frontiers.items():
+            if ft.is_valid:
+                p = ft.pos3d
+                self.logger.info(f"[filter]   frontier {fid}: pos3d=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
+
+        n_bbox_removed = 0
+        n_gain_removed = 0
+        n_vdz_removed = 0
+        n_occ_removed = 0
+
         for fid, ft in list(self.frontiers.items()):
             if not ft.is_valid:
                 continue  # already invalid elsewhere
@@ -656,6 +777,7 @@ class FrontierManager(Base):
                     and bbox[4] <= z <= bbox[5]
                 ):
                     ft.set_invalid()
+                    n_bbox_removed += 1
                     self.logger.debug(f"Frontier {fid} invalid (bbox).")
                     continue
 
@@ -664,6 +786,7 @@ class FrontierManager(Base):
             g = float(g if g is not None else 0.0)
             if g < min_gain:
                 ft.set_invalid()
+                n_gain_removed += 1
                 self.logger.debug(f"Frontier {fid} invalid (gain<{min_gain}).")
                 continue
 
@@ -672,17 +795,49 @@ class FrontierManager(Base):
                 vd_z = float(ft.view_direction[2])
                 if abs(vd_z) > max_vd_z:
                     ft.set_invalid()
+                    n_vdz_removed += 1
                     self.logger.debug(f"Frontier {fid} invalid (|vd_z|>{max_vd_z}).")
                     continue
 
             # 4) Too close to occupied space
             if check_occ and self.planner.isoccupied(ft.pos3d):
                 ft.set_invalid()
+                n_occ_removed += 1
                 self.logger.debug(f"Frontier {fid} invalid (near occupied).")
                 continue
 
+        n_after_bbox = n_before - n_bbox_removed
+        n_after_gain = n_after_bbox - n_gain_removed
+        n_after_vdz = n_after_gain - n_vdz_removed
+        n_after_occ = n_after_vdz - n_occ_removed
+
+        if bbox is not None:
+            self.logger.info(f"[filter] After bbox:     {n_after_bbox} valid  (-{n_bbox_removed})")
+        self.logger.info(f"[filter] After gain:     {n_after_gain} valid  (-{n_gain_removed}, threshold={min_gain})")
+        if max_vd_z is not None:
+            self.logger.info(f"[filter] After vd_z:     {n_after_vdz} valid  (-{n_vdz_removed}, max_vd_z={max_vd_z})")
+        if check_occ:
+            self.logger.info(f"[filter] After occ:      {n_after_occ} valid  (-{n_occ_removed})")
+        self.logger.info(f"[filter] End:   {n_after_occ} valid frontiers remain")
+
         # Purge all marked
         self.remove_invalid_frontiers()
+
+    def _segment_collision_free(self, p1: np.ndarray, p2: np.ndarray) -> bool:
+        """
+        Return True if no point along the segment p1→p2 is within min_dist2occ
+        of an occupied voxel. Samples at half the min_dist2occ spacing.
+        """
+        seg = np.asarray(p2, dtype=float) - np.asarray(p1, dtype=float)
+        length = float(np.linalg.norm(seg))
+        if length < 1e-6:
+            return not self.planner.isoccupied(p1)
+        step = max(self.planner._min_dist2occ / 2.0, 1e-3)
+        n = max(2, int(np.ceil(length / step)))
+        for t in np.linspace(0.0, 1.0, n):
+            if self.planner.isoccupied(p1 + t * seg):
+                return False
+        return True
 
     def get_waypoints_from_graph(self, ft_id: int, robot_pose_id: int) -> np.ndarray:
         """
@@ -753,6 +908,48 @@ class FrontierManager(Base):
 
         break_pt = np.asarray(fine_pts[break_idx], dtype=float)
 
+        # If the direct approach is blocked far from the frontier (wall in the way),
+        # query the free-voxel KD-tree for the nearest free voxel to the frontier.
+        # That voxel is on the mapper-observed side of any opening (doorway, gap) and
+        # gives RRT* a goal it can actually route through, rather than the wall face.
+        # Walk through the k nearest candidates until one is both unoccupied and
+        # reachable from the agent without crossing an occupied voxel.
+        dist_to_ft = float(np.linalg.norm(break_pt - np.asarray(frontier.pos3d, dtype=float)))
+        if dist_to_ft > self.v_tras_thre and self.planner._free_kdt is not None:
+            agent_pos = np.asarray(coarse_pts[0], dtype=float)
+            k = min(50, self.planner._free_kdt.n)
+            _, nn_idxs = self.planner._free_kdt.query(frontier.pos3d, k=k)
+            found = False
+            for nn_idx in np.atleast_1d(nn_idxs):
+                candidate = np.asarray(self.planner._free_kdt.data[nn_idx], dtype=float)
+                if (
+                    not self.planner.isoccupied(candidate)
+                    and self._segment_collision_free(agent_pos, candidate)
+                ):
+                    self.logger.debug(
+                        "Behind-wall frontier: snapping goal from wall-face (%.2f m away) "
+                        "to nearest collision-free voxel at (%.2f, %.2f, %.2f).",
+                        dist_to_ft, *candidate,
+                    )
+                    break_pt = candidate
+                    found = True
+                    break
+            if not found:
+                # No collision-free intermediate goal exists from the current agent
+                # position — but the frontier may become reachable once the agent
+                # moves elsewhere.  Penalise gain so it is deprioritised; repeated
+                # failures will drive it below filter_min_gain and it will be removed
+                # by the normal filter rather than being dropped prematurely here.
+                ft = self.frontiers[ft_id]
+                ft.gain   = max(float(ft.gain   or 1e-4) * 0.5, 1e-4)
+                ft.u_gain = max(float(ft.u_gain or 1e-4) * 0.5, 1e-4)
+                self.logger.debug(
+                    "Behind-wall frontier %d: no collision-free intermediate goal found "
+                    "among %d candidates — penalising gain (×0.5), skipping this cycle.",
+                    ft_id, k,
+                )
+                return None
+
         # Close enough to the frontier? keep its orientation, place at break_pt
         if np.linalg.norm(break_pt - frontier.pos3d) < self.v_tras_thre:
             W_T_C = frontier.pose6d.copy()
@@ -820,7 +1017,12 @@ class FrontierManager(Base):
         if use_graph:
             current_pose_id = self.add_robot_poses([current_pose])[0]
             goal_pose = self.get_waypoints_from_graph(goal_ft_id, current_pose_id)
-
+            if goal_pose is None:
+                # Frontier is temporarily unreachable from the current position;
+                # gain has already been penalised — skip this cycle without dropping.
+                self.current_goal_ft_id = None
+                self.current_goal_pose = None
+                return None
         else:
             goal_pose = self.get_frontier_pose(goal_ft)
 
