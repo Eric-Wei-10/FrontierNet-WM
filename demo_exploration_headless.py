@@ -27,6 +27,7 @@ from utils.vis_utils import (
 
 # FrontierNet
 from frontier.detector import FrontierDetector
+from frontier.classic_detector import ClassicFrontierDetector
 from frontier.model.predict import load_model
 from utils.frontier_utils import read_config_yaml
 
@@ -254,11 +255,16 @@ class HeadlessExplorerApp:
         self.mapper: Optional[WaveMapper] = None
         self.ft_manager: Optional[FrontierManager] = None
         self.ft_detector: Optional[FrontierDetector] = None
+        self.classic_detector: Optional[ClassicFrontierDetector] = None
         self.VOX_SIZE = (
             self.config["voxel_size"]
             if self.config["voxel_size"] is not None
             else self.VOX_SIZE
         )
+
+        # Global occupancy map pre-built from voxel grid / mesh (None until setup_system)
+        self.global_occ_pts: Optional[np.ndarray] = None
+        self.global_free_pts: Optional[np.ndarray] = None
 
         # Path & motion tracking
         self.path_to_go: List[np.ndarray] = []
@@ -271,6 +277,19 @@ class HeadlessExplorerApp:
         self._stuck_window: int = 5              # number of recent steps to inspect
         self._stuck_disp_threshold: float = 0.3  # metres — min cumulative path length
         self._recent_positions: deque = deque(maxlen=self._stuck_window + 1)
+
+        # Fix 2: raw loop-iteration counter independent of n_robot_poses.
+        # n_robot_poses only increments when is_moving() fires; it freezes during
+        # micro-loops (snap goal == robot position).  _loop_iter always advances so
+        # we can force detection and bound runaway loops.
+        self._loop_iter: int = 0
+        self._frozen_iters: int = 0          # consecutive iterations with same n_robot_poses
+        self._last_n_robot_poses: int = -1   # n_robot_poses value at previous iteration
+
+        # Fix 3: dirty flag for gain recomputation.
+        # gain_adjustment_detr is O(N*M) in frontiers × robot poses; skip it when
+        # neither the pose set nor the frontier set has changed.
+        self._last_gain_adj_n_poses: int = -1
 
         # JSON output
         save_dir = os.path.join(os.path.dirname(__file__), "output")
@@ -514,28 +533,50 @@ class HeadlessExplorerApp:
         max_time_s = self.args.max_time
         start_time = time.time()
 
-        # Initial mapping (one frame) to bootstrap map
+        # Initial mapping bootstrap.
+        # When --voxel_grid is set the planner already has the complete global map
+        # from setup_system(); we still integrate the first frame into the wavemap
+        # (for any future use) but do NOT overwrite the planner's KDTrees with the
+        # partial single-frame output.
         rgb, depth0 = self.get_rgbd()
-        # import pdb; pdb.set_trace()
-        # import matplotlib.pyplot as plt
-        # plt.imsave('initial_view.png', rgb)
         C_T_W = self.renderer.get_extrinsic()
         W_T_C = np.linalg.inv(C_T_W)
         self.mapper.insert_depth_to_buffer(depth=depth0, transform=W_T_C)
         logging.info("Initial mapping round started.")
         self.mapper.integrate_from_buffer()
-        self.mapper.interpolate_occupancy_grid()
-        og = self.mapper.get_occupancy_grid()
-        self.ft_manager.update_map(free_map=og["free"], occ_map=og["occupied"])
+        if not self.args.voxel_grid:
+            self.mapper.interpolate_occupancy_grid()
+            og = self.mapper.get_occupancy_grid()
+            self.ft_manager.update_map(free_map=og["free"], occ_map=og["occupied"])
         
         
 
         while True:
+            self._loop_iter += 1
+
             C_T_W = self.renderer.get_extrinsic()
             W_T_C = np.linalg.inv(C_T_W)
             n_robot_poses = len(self.ft_manager.robot_poses)
 
-            logging.info(" -------Current exploration step: %d -------", n_robot_poses)
+            # Fix 2: track how many consecutive iterations n_robot_poses has not grown.
+            # When the snap goal equals the robot's position the step counter freezes
+            # and the interval-based detect trigger never fires.
+            if n_robot_poses == self._last_n_robot_poses:
+                self._frozen_iters += 1
+            else:
+                self._frozen_iters = 0
+                self._last_n_robot_poses = n_robot_poses
+
+            rpos = W_T_C[:3, 3]
+            logging.info(
+                "===== step %04d  robot=(%+.2f,%+.2f,%+.2f)  "
+                "frontiers=%d  graveyard=%d  path_remaining=%d =====",
+                n_robot_poses,
+                rpos[0], rpos[1], rpos[2],
+                len(self.ft_manager.valid_frontiers),
+                len(self.ft_manager._graveyard),
+                len(self.path_to_go),
+            )
 
             if n_robot_poses > max_steps:
                 logging.info("Maximum steps reached, exploration finished.")
@@ -545,25 +586,77 @@ class HeadlessExplorerApp:
                 logging.info("Time limit reached, exploration finished.")
                 break
 
+            # Safety: bound runaway loops that don't advance n_robot_poses.
+            _MAX_LOOP_ITERS = max_steps * 15
+            if self._loop_iter > _MAX_LOOP_ITERS:
+                logging.warning(
+                    "Max loop iterations (%d) reached without enough robot progress — "
+                    "terminating to avoid infinite loop.",
+                    _MAX_LOOP_ITERS,
+                )
+                break
+
             no_more_frontier = (
                 len(self.ft_manager.valid_frontiers) == 0 and n_robot_poses >= 1
             )
-            # Detection runs on a fixed interval (or when the frontier list is empty).
-            # Kept separate from replanning so the model doesn't run every step
-            # just because the current path was short.
+            # Fix 2: also force detection after detect_interval*2 frozen iterations so
+            # a stuck snap goal doesn't permanently suppress the detection trigger.
+            _FROZEN_DETECT_EVERY = self.detect_interval * 2
+            frozen_force_detect = (
+                self._frozen_iters > 0
+                and self._frozen_iters % _FROZEN_DETECT_EVERY == 0
+            )
             should_detect = no_more_frontier or (
                 n_robot_poses % self.detect_interval == 0
-            )
-            # Replanning runs whenever the path is exhausted OR detection just
-            # added new frontiers (so the planner can consider them immediately).
-            should_replan = not self.path_to_go or should_detect
+            ) or frozen_force_detect
 
+            # Replan only when there is no active path, or the current goal
+            # frontier has disappeared (filtered / graveyard). Detection alone
+            # no longer forces a mid-path goal switch: new frontiers are added
+            # to the pool but the robot keeps heading toward its current goal.
+            valid_ids = {ft.id for ft in self.ft_manager.valid_frontiers}
+            current_goal_alive = (
+                self.ft_manager.current_goal_ft_id is not None
+                and self.ft_manager.current_goal_ft_id in valid_ids
+            )
+            should_replan = not self.path_to_go or not current_goal_alive
+
+            detect_reason = (
+                "no_frontiers" if no_more_frontier
+                else "frozen" if frozen_force_detect
+                else f"interval({n_robot_poses}%{self.detect_interval}==0)" if should_detect
+                else "skip"
+            )
+            replan_reason = (
+                "path_empty" if not self.path_to_go
+                else "goal_gone" if not current_goal_alive
+                else "skip"
+            )
+            logging.info("  detect=%s  replan=%s", detect_reason, replan_reason)
+
+            ft_list = None  # Fix 3: initialise so it's visible outside the detect block
             if should_detect:
                 logging.info("Running frontier detection (step %d).", n_robot_poses)
+                # Record this as an observed pose so the robot_path_filter knows
+                # the robot genuinely observed this location (not just passed by).
+                self.ft_manager.add_detection_pose(W_T_C)
                 rgb, depth = self.get_rgbd()
 
                 # Frontier detection — branch on model type
-                if self.args.model_type == "detr_unet":
+                if self.args.model_type == "classic":
+                    # Classic map-based frontier detection (Yamauchi 1997).
+                    # Always interpolate the wavemap at detect steps so we have
+                    # the robot's current observed free/occupied space, regardless
+                    # of whether --voxel_grid is set (the voxel_grid is used only
+                    # for path planning, not for frontier detection).
+                    self.mapper.interpolate_occupancy_grid()
+                    og = self.mapper.get_occupancy_grid()
+                    ft_list = self.classic_detector.detect(
+                        free_pts=og["free"],
+                        occ_pts=og["occupied"],
+                        W_T_C=W_T_C,
+                    )
+                elif self.args.model_type in {"unet_detr", "detr", "cond_detr"}:
                     # DETR: goals are (u,v,z) 3-D points; GMM weight = info-gain proxy.
                     # Occluded goals are handled transparently by the path planner.
                     ft_list = self.ft_detector.detect_detr(
@@ -593,7 +686,7 @@ class HeadlessExplorerApp:
 
                 # Add into manager
                 if ft_list:
-                    if self.args.model_type == "detr_unet":
+                    if self.args.model_type in {"unet_detr", "detr", "cond_detr", "classic"}:
                         ft_list = self.ft_manager.dedup_new_frontiers(
                             ft_list, radius=self.args.detr_dedup_radius
                         )
@@ -620,26 +713,44 @@ class HeadlessExplorerApp:
                     logging.info("No frontiers, exploration finished.")
                     break
 
-            # Update mapper continuously
+            # Update mapper continuously.
+            # When --voxel_grid is set the planner uses the pre-loaded global map
+            # throughout; wavemap still accumulates observations but its (partial)
+            # output is not used to overwrite the planner's KDTrees.
             self.mapper.integrate_from_buffer()
-            self.mapper.interpolate_occupancy_grid()
+            if not self.args.voxel_grid:
+                self.mapper.interpolate_occupancy_grid()
+                og = self.mapper.get_occupancy_grid()
+                self.ft_manager.update_map(free_map=og["free"], occ_map=og["occupied"])
 
-            og = self.mapper.get_occupancy_grid()
-            self.ft_manager.update_map(free_map=og["free"], occ_map=og["occupied"])
-            if self.args.model_type == "detr_unet":
-                self.ft_manager.gain_adjustment_detr()
-            else:
-                self.ft_manager.gain_adjustment()
-            self.ft_manager.filter_frontiers()
-            self.ft_manager.merge_frontiers()
-            self.ft_manager.filter_frontiers()
+            # Fix 3: gain_adjustment is O(N*M) in frontiers × robot poses.  Only
+            # rerun it when the inputs have actually changed: new robot poses were
+            # added (step counter advanced) or new frontiers were just detected.
+            # update_utility always runs because it depends on the current robot
+            # position, which can change even without new poses being recorded.
+            _gain_inputs_changed = (
+                n_robot_poses > self._last_gain_adj_n_poses
+                or bool(ft_list)
+            )
+            if _gain_inputs_changed:
+                if self.args.model_type in {"unet_detr", "detr", "cond_detr", "classic"}:
+                    self.ft_manager.gain_adjustment_detr()
+                else:
+                    self.ft_manager.gain_adjustment()
+                self.ft_manager.filter_frontiers()
+                self.ft_manager.merge_frontiers()
+                self.ft_manager.filter_frontiers()
+                self._last_gain_adj_n_poses = n_robot_poses
             self.ft_manager.update_utility(current_pos=W_T_C[:3, 3])
 
             # Replan if needed
             if should_replan and (self.move_enough or not self.path_to_go):
                 logging.info("Replanning...")
                 logging.debug(f"Replanning (interval={self.plan_interval}).")
-                self.path_to_go = self.ft_manager.plan_path_to_goal(W_T_C) or []
+                self.path_to_go = self.ft_manager.plan_path_to_goal(
+                    W_T_C,
+                    direct_voxel_snap=bool(self.args.voxel_grid),
+                ) or []
                 if self.path_to_go:
                     logging.info(
                         f"Path to goal found with {len(self.path_to_go)} steps."
@@ -665,34 +776,38 @@ class HeadlessExplorerApp:
                 logging.info(f"Writing state to {self.json_path}")
                 self.ft_manager.write_to_file(file_path=self.json_path)
 
-            # Execute one movement step if path exists
+            # Execute one movement step if path exists.
+            # Stuck detection runs inside this block so that stationary frames
+            # (path exhausted, waiting for replanning or detection) never
+            # contribute zero displacement and trigger a false stuck alarm.
             if self.path_to_go:
                 logging.debug("Moving along the path.")
                 self.move(steps=1)
 
-            # Stuck detection: record current position and check cumulative
-            # path length over the last _stuck_window steps.  If the robot
-            # has barely moved, the current goal is unreachable — drop it.
-            self._recent_positions.append(W_T_C[:3, 3].copy())
-            if len(self._recent_positions) == self._recent_positions.maxlen:
-                pts = list(self._recent_positions)
-                cumulative = sum(
-                    float(np.linalg.norm(pts[i + 1] - pts[i]))
-                    for i in range(len(pts) - 1)
-                )
-                if cumulative < self._stuck_disp_threshold:
-                    goal_id = self.ft_manager.current_goal_ft_id
-                    if goal_id is not None:
-                        logging.warning(
-                            "Stuck detected: cumulative displacement %.2f m over %d steps "
-                            "< %.2f m — dropping frontier %s.",
-                            cumulative, self._stuck_window,
-                            self._stuck_disp_threshold, goal_id,
-                        )
-                        self.ft_manager.remove_frontiers([goal_id])
-                        self._recent_positions.clear()
-                        self.path_to_go = []
-                        self.move_enough = True
+                # Record position and check cumulative displacement only while
+                # actively following a path. If the robot covers less than
+                # _stuck_disp_threshold metres over _stuck_window consecutive
+                # move-steps, the current goal is physically unreachable.
+                self._recent_positions.append(W_T_C[:3, 3].copy())
+                if len(self._recent_positions) == self._recent_positions.maxlen:
+                    pts = list(self._recent_positions)
+                    cumulative = sum(
+                        float(np.linalg.norm(pts[i + 1] - pts[i]))
+                        for i in range(len(pts) - 1)
+                    )
+                    if cumulative < self._stuck_disp_threshold:
+                        goal_id = self.ft_manager.current_goal_ft_id
+                        if goal_id is not None:
+                            logging.warning(
+                                "Stuck detected: cumulative displacement %.2f m over %d steps "
+                                "< %.2f m — dropping frontier %s.",
+                                cumulative, self._stuck_window,
+                                self._stuck_disp_threshold, goal_id,
+                            )
+                            self.ft_manager.remove_frontiers([goal_id])
+                            self._recent_positions.clear()
+                            self.path_to_go = []
+                            self.move_enough = True
 
         # Final state output
         logging.info("Exploration finished, total steps: %d", n_robot_poses)
@@ -736,6 +851,84 @@ class HeadlessExplorerApp:
                 self.move_enough = True
 
     # ---------- setup ----------
+
+    # ---------- global map helpers ----------
+
+    def _load_free_from_voxel_grid(self, ply_path: str) -> None:
+        """
+        Populate self.global_free_pts from a pre-computed navigable free-space
+        voxel grid PLY file (e.g. eval_data/voxel_grid/000876-voxel_grid.ply).
+
+        The file stores the ground-truth traversable voxel centres for the scene,
+        so loading it makes the planner's free-space KDTree complete from step 0
+        rather than being built up incrementally from wavemap observations.
+        """
+        logging.info("Loading free-space voxel grid from: %s", ply_path)
+        vg = o3d.io.read_voxel_grid(ply_path)
+        voxels = vg.get_voxels()
+        if not voxels:
+            logging.warning("Voxel grid file contained no voxels; global_free_pts unchanged.")
+            return
+
+        free_centers = np.array(
+            [vg.get_voxel_center_coordinate(v.grid_index) for v in voxels],
+            dtype=np.float32,
+        )
+
+        # Restrict to planning bounds so the KDTree stays tight
+        bounds = self.config.get("bounds")
+        if bounds is not None and len(free_centers) > 0:
+            b = bounds
+            mask = (
+                (free_centers[:, 0] >= b[0]) & (free_centers[:, 0] <= b[1])
+                & (free_centers[:, 1] >= b[2]) & (free_centers[:, 1] <= b[3])
+                & (free_centers[:, 2] >= b[4]) & (free_centers[:, 2] <= b[5])
+            )
+            free_centers = free_centers[mask]
+
+        self.global_free_pts = free_centers
+        logging.info(
+            "global_free_pts set to %d voxels from file (voxel_size=%.3f m).",
+            len(free_centers), vg.voxel_size,
+        )
+
+    def _build_occ_from_mesh(self) -> None:
+        """
+        Populate self.global_occ_pts by voxelising the scene mesh surfaces.
+        Used together with _load_free_from_voxel_grid() to give the planner
+        a complete occupied-space KDTree without deriving it from wavemap.
+        """
+        from scipy.spatial import KDTree as _KDTree
+
+        logging.info("Building occupied voxel map from mesh: %s", self.args.mesh)
+        model = o3d.io.read_triangle_model(self.args.mesh)
+        combined = o3d.geometry.TriangleMesh()
+        for mesh_info in model.meshes:
+            combined += mesh_info.mesh
+
+        vg = o3d.geometry.VoxelGrid.create_from_triangle_mesh(
+            combined, voxel_size=self.VOX_SIZE
+        )
+        occ_centers = np.array(
+            [vg.get_voxel_center_coordinate(v.grid_index) for v in vg.get_voxels()],
+            dtype=np.float32,
+        )
+
+        bounds = self.config.get("bounds")
+        if bounds is not None and len(occ_centers) > 0:
+            b = bounds
+            mask = (
+                (occ_centers[:, 0] >= b[0]) & (occ_centers[:, 0] <= b[1])
+                & (occ_centers[:, 1] >= b[2]) & (occ_centers[:, 1] <= b[3])
+                & (occ_centers[:, 2] >= b[4]) & (occ_centers[:, 2] <= b[5])
+            )
+            occ_centers = occ_centers[mask]
+
+        self.global_occ_pts = occ_centers
+        logging.info(
+            "global_occ_pts set to %d occupied voxels from mesh.",
+            len(occ_centers),
+        )
 
     def setup_system(self) -> None:
         """Initialize renderer, mapper, detector, and manager."""
@@ -807,41 +1000,81 @@ class HeadlessExplorerApp:
         }
         self.mapper = WaveMapper(params=params)
 
-        # FrontierNet
+        # FrontierNet detector — either neural network or classic map-based
         model_type = self.args.model_type
-        use_depth = True
-        feature_layers = (
-            [int(x) for x in self.args.vit_feature_layers.split(",")]
-            if self.args.vit_feature_layers
-            else None
-        )
-        net = load_model(
-            path=self.args.unet_weight,
-            num_classes=self.config["num_classes"],
-            use_depth=use_depth,
-            model_type=model_type,
-            vit_depth=self.args.vit_depth,
-            feature_layers=feature_layers,
-            num_queries=self.args.detr_num_queries,
-            detr_aux_depth=self.args.detr_aux_depth,
-        )
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.ft_detector = FrontierDetector(
-            model=net,
-            camera_intrinsic=intr.intrinsic_matrix.copy(),
-            use_depth=use_depth,
-            img_size_model=self.config["input_img_size"],
-            device=device,
-            log_level=self.args.log_level,
-            model_type=model_type,
-            disocclusion_only=self.args.disocclusion_only,
-            edge_spread_width=self.args.edge_spread_width,
-        )
+        if model_type == "classic":
+            # Classic Yamauchi (1997) frontier detection — no neural network.
+            self.ft_detector = None
+            self.classic_detector = ClassicFrontierDetector(
+                voxel_size=self.VOX_SIZE,
+                camera_intrinsic=intr.intrinsic_matrix.copy(),
+                min_frontier_size=self.args.classic_min_frontier_size,
+                cluster_eps=self.args.classic_cluster_eps,
+                log_level=self.args.log_level,
+            )
+            logging.info(
+                "Classic frontier detector initialised "
+                "(voxel_size=%.2f, cluster_eps=%.2f, min_size=%d).",
+                self.VOX_SIZE,
+                self.args.classic_cluster_eps,
+                self.args.classic_min_frontier_size,
+            )
+        else:
+            use_depth = True
+            feature_layers = (
+                [int(x) for x in self.args.vit_feature_layers.split(",")]
+                if self.args.vit_feature_layers
+                else None
+            )
+            net = load_model(
+                path=self.args.unet_weight,
+                num_classes=self.config["num_classes"],
+                use_depth=use_depth,
+                model_type=model_type,
+                vit_depth=self.args.vit_depth,
+                feature_layers=feature_layers,
+                num_queries=self.args.detr_num_queries,
+                detr_aux_depth=self.args.detr_aux_depth,
+                factory_d_model=self.args.factory_d_model,
+                factory_n_tokens=self.args.factory_n_tokens,
+                factory_n_layers=self.args.factory_n_layers,
+                factory_n_heads=self.args.factory_n_heads,
+                factory_dropout=self.args.factory_dropout,
+            )
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.ft_detector = FrontierDetector(
+                model=net,
+                camera_intrinsic=intr.intrinsic_matrix.copy(),
+                use_depth=use_depth,
+                img_size_model=self.config["input_img_size"],
+                device=device,
+                log_level=self.args.log_level,
+                model_type=model_type,
+                disocclusion_only=self.args.disocclusion_only,
+                edge_spread_width=self.args.edge_spread_width,
+            )
 
         # Frontier Manager
         self.ft_manager = FrontierManager(
             params=self.config, log_level=self.args.log_level
         )
+
+        # When --voxel_grid is provided, pre-load the complete free-space and
+        # occupied maps so the planner knows the entire scene from step 0.
+        # The per-step wavemap updates in exploration() are then skipped so
+        # this known map is not overwritten by partial observations.
+        if self.args.voxel_grid:
+            self._load_free_from_voxel_grid(self.args.voxel_grid)
+            self._build_occ_from_mesh()
+            self.ft_manager.update_map(
+                free_map=self.global_free_pts,
+                occ_map=self.global_occ_pts,
+            )
+            logging.info(
+                "Planner initialised with global map: %d free, %d occupied voxels.",
+                len(self.global_free_pts) if self.global_free_pts is not None else 0,
+                len(self.global_occ_pts) if self.global_occ_pts is not None else 0,
+            )
 
         # Wipe and recreate the output directory so each run starts clean
         # (prevents multiple runs from being concatenated into the same JSON).
@@ -932,6 +1165,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--mesh", type=str, required=True, help="Path to the mesh file")
     p.add_argument(
+        "--voxel_grid",
+        type=str,
+        default=None,
+        help=(
+            "Path to a pre-computed free-space voxel grid PLY file "
+            "(e.g. eval_data/voxel_grid/000876-voxel_grid.ply). "
+            "When provided the planner's free-space KDTree is built from this "
+            "file and the occupied KDTree from the mesh, so the entire navigable "
+            "area is known from step 0. Per-step wavemap-based map updates are "
+            "skipped, keeping the known map fixed throughout exploration."
+        ),
+    )
+    p.add_argument(
         "--config",
         type=str,
         default="config/hm3d_exploration.yaml",
@@ -959,13 +1205,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model_type",
         type=str,
         default="dpt",
-        choices=["dpt", "unet", "detr_unet"],
+        choices=["dpt", "unet", "unet_detr", "detr", "cond_detr", "classic"],
         help=(
             "Model architecture: "
             "'dpt' (ViT+DPT, RGB-only, dense df_seg head), "
             "'unet' (ResNet34+UNet, RGB-D, dense df_seg head), "
-            "'detr_unet' (ResNet34+UNet, RGB-only, sparse DETR head — "
-            "goals parameterised as (u,v,z) 3-D points, GMM weight = info-gain proxy)"
+            "'unet_detr' (ResNet34+UNet, RGB-only, sparse DETR head), "
+            "'detr' (FrontierDETR: ResNet50+enc+dec, DETR-Factory), "
+            "'cond_detr' (FrontierConditionalDETR: ResNet50+enc+cond dec, DETR-Factory), "
+            "'classic' (Yamauchi 1997 map-based, no neural network)"
         ),
     )
     p.add_argument(
@@ -1027,25 +1275,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Width in pixels of the horizontal dilation applied to df_raw after "
              "disocclusion redistribution (must be odd for symmetric spread; default 20).",
     )
-    # --- DETR-specific args (detr_unet mode only) ---
+    # --- DETR-specific args (unet_detr mode only) ---
     p.add_argument(
         "--detr_conf_thresh",
         type=float,
         default=0.3,
-        help="(detr_unet) Minimum slot confidence to accept as a frontier candidate.",
+        help="(unet_detr) Minimum slot confidence to accept as a frontier candidate.",
     )
     p.add_argument(
         "--detr_num_queries",
         type=int,
         default=10,
-        help="(detr_unet) Number of DETR slot queries (must match the trained checkpoint).",
+        help="(unet_detr / detr / cond_detr) Number of DETR slot queries (must match the trained checkpoint).",
+    )
+    p.add_argument(
+        "--factory_d_model",
+        type=int,
+        default=256,
+        help="(detr / cond_detr) Transformer embedding dimension. Default 256.",
+    )
+    p.add_argument(
+        "--factory_n_tokens",
+        type=int,
+        default=374,
+        help=(
+            "(detr / cond_detr) Number of spatial tokens for the training resolution. "
+            "Default 374 = (544//32)×(720//32) for 544×720 input."
+        ),
+    )
+    p.add_argument(
+        "--factory_n_layers",
+        type=int,
+        default=6,
+        help="(detr / cond_detr) Number of encoder and decoder layers. Default 6.",
+    )
+    p.add_argument(
+        "--factory_n_heads",
+        type=int,
+        default=8,
+        help="(detr / cond_detr) Number of attention heads. Default 8.",
+    )
+    p.add_argument(
+        "--factory_dropout",
+        type=float,
+        default=0.1,
+        help="(detr / cond_detr) Dropout rate in transformer layers. Must match training. Default 0.1.",
     )
     p.add_argument(
         "--detr_aux_depth",
         action="store_true",
         default=False,
         help=(
-            "(detr_unet) Set this flag when the checkpoint was trained with an "
+            "(unet_detr) Set this flag when the checkpoint was trained with an "
             "auxiliary dense depth supervision head (detr_aux_depth=True in "
             "TwoHeadUnet). Must match the training configuration so the state-dict "
             "keys align; also enables the aux-depth panel in debug images."
@@ -1056,7 +1337,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=100.0,
         help=(
-            "(detr_unet) Multiplicative scale applied to the raw GMM weight before "
+            "(unet_detr) Multiplicative scale applied to the raw GMM weight before "
             "it is stored as frontier gain.  The dense pipeline produces gains in "
             "[~1, 9] (midpoint × 10); set this so DETR weights pass filter_min_gain. "
             "Default 10.0."
@@ -1067,7 +1348,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help=(
-            "(detr_unet) Exclusion radius in metres for cross-frame deduplication. "
+            "(unet_detr) Exclusion radius in metres for cross-frame deduplication. "
             "A newly detected frontier is dropped if any existing valid frontier "
             "lies within this distance. Default 0.5 m."
         ),
@@ -1077,9 +1358,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help=(
-            "(detr_unet) Multiplicative discount applied to the gain of non-occluded "
+            "(unet_detr) Multiplicative discount applied to the gain of non-occluded "
             "(already-visible) frontiers. Occluded frontiers keep their full gain so "
             "the planner prefers exploring hidden/unseen areas. Default 0.1."
+        ),
+    )
+    # --- Classic (Yamauchi 1997) args ---
+    p.add_argument(
+        "--classic_min_frontier_size",
+        type=int,
+        default=5,
+        help=(
+            "(classic) Minimum number of frontier voxels in a DBSCAN cluster to be "
+            "accepted as a valid frontier. Smaller clusters are treated as noise. "
+            "Default 5."
+        ),
+    )
+    p.add_argument(
+        "--classic_cluster_eps",
+        type=float,
+        default=0.4,
+        help=(
+            "(classic) DBSCAN neighbourhood radius (metres) for clustering frontier "
+            "voxels into frontier regions. Default 0.4 m."
         ),
     )
     return p

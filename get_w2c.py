@@ -3,21 +3,26 @@ import argparse
 import os
 
 # 目标文件路径
-TARGET_YAML_PATH = "/cluster/project/cvg/students/shangwu/FrontierNet/config/hm3d_exploration_1.yaml"
+TARGET_YAML_PATH = "/cluster/project/cvg/students/shangwu/FrontierNet/config/hm3d_exploration_876_3.yaml"
 
 def generate_matrix(x, y, z, angle_deg):
     """
     生成水平视线的 World-to-Camera 矩阵 (4x4)
     """
     theta = np.deg2rad(angle_deg)
-    
+
     # 1. 构建相机坐标轴 (在世界坐标系下)
+    # 与 random_pose.py 的 pitch 定义一致:
+    #   angle=0   → 看向 +Y
+    #   angle=90  → 看向 +X
+    #   angle=180 → 看向 -Y
+    #   angle=270 → 看向 -X
     # Z轴 (Forward): 指向视线方向 (XY平面)
-    cam_z_w = np.array([np.cos(theta), np.sin(theta), 0.0])
-    
+    cam_z_w = np.array([np.sin(theta), np.cos(theta), 0.0])
+
     # Y轴 (Down): 垂直指向地面 -Z
     cam_y_w = np.array([0.0, 0.0, -1.0])
-    
+
     # X轴 (Right): Y x Z
     cam_x_w = np.cross(cam_y_w, cam_z_w)
     

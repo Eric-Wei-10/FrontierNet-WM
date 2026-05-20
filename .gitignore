@@ -52,6 +52,6 @@ data/
 
 # files
 output/
-output_old/
 model_weights/
 *.err
+eval_data/

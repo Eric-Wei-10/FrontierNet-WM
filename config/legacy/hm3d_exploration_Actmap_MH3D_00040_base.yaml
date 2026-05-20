@@ -1,0 +1,43 @@
+# Base config for scene MH3D_00040 (Actmap) — DETR pipeline
+# Pose configs inherit via:  _base: hm3d_exploration_Actmap_MH3D_00040_base.yaml
+
+# ------ FrontierNet Model ------
+df_normalizer: 10
+df_thr: 0.3
+num_classes: 11
+input_img_size: [544, 720]
+focal_length: 300.0
+
+# ------ Frontier Manager ------
+filter_bbox: [-100, 100, -100, 100, -0.5, 2.0]  # TODO: set per-episode tight bounds
+filter_max_vd_z: 1
+force_all_frontier_to_xy: False
+filter_min_gain: 0.001
+visited_trans_threshold: 0.5
+visited_angle_threshold: 0.4
+visited_gain_reduction_factor: 0
+detr_visited_gain_reduction_factor: 0.5
+utility_gain_factor: 1.0
+
+render_K: [60.0, 0.0, 64.0, 0.0, 60.0, 64.0, 0.0, 0.0, 1.0]
+render_H: 128
+render_W: 128
+render_d_range: 3.5
+render_decrease_factor: 1.0
+
+# ------ Mapping ------
+voxel_size: 0.1
+depth_range: 3.5
+
+# ------ Planning ------
+bounds: [-100, 100, -100, 100, -0.5, 2.0]  # TODO: set per-episode tight bounds
+use_free_grid: True
+use_occ_grid: True
+min_dist2occ: 0.2
+max_dist2free: 0.075
+max_planning_time: 1.5
+planning_algo: rrtstar
+
+# ------ Exploration App ------
+predict_interval: 6
+plan_interval: 15

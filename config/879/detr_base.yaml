@@ -1,0 +1,11 @@
+_base: ../base_detr_exploration.yaml
+
+filter_bbox: [-6, 7, -2, 16, 0.3, 1.85]
+bounds:      [-6, 7, -2, 16, 0.3, 0.80]
+proximity_retirement_radius: 1.0
+
+observer_cam_extrinsic:
+  - [ 0.003, -1.0,     0.011,  7.508]
+  - [-0.996, -0.004, -0.092,  0.562]
+  - [ 0.092, -0.01,  -0.996, 12.947]
+  - [ 0.0,     0.0,     0.0,     1.0 ]

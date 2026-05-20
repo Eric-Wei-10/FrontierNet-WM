@@ -13,7 +13,13 @@ filter_min_gain: 1                            # minimum gain(volumn in m^3) to b
 visited_trans_threshold: 0.5                  # threshold to consider a frontier as visited 
 visited_angle_threshold: 0.4                  # threshold to consider a frontier as visited 
 visited_gain_reduction_factor: 2000           # factor to reduce the gain of frontiers based on robot trajectory (the higher the value, the more reduction)
+detr_visited_gain_reduction_factor: 0.2       # (detr_unet) multiplicative decay per close robot pose; u_gain = gain * factor^n_close
+detr_visited_dist_threshold: 1.5             # (detr) distance (m) from robot to frontier pos3d that counts as "visited"; larger = more aggressive retirement
+detr_max_n_close: 5                          # retire frontier after robot passes within detr_visited_dist_threshold this many times (0 = disabled)
+max_active_frontiers: 20                     # hard cap on active frontier count; lowest-utility retired first (0 = unlimited)
+proximity_retirement_radius: 1.0             # immediately retire non-goal frontiers within this radius (m) of the current robot position (0 = disabled)
 utility_gain_factor: 1.0                      # the higher the value, the more dominant the gain is in the utility function
+utility_dist_exponent: 1.5                    # distance penalty exponent in utility (1.0=linear, 1.5=prefer nearby, 2.0=strongly prefer nearby)
 
 render_K: [60.0, 0.0, 64.0, 0.0, 60.0, 64.0, 0.0, 0.0, 1.0]   # camera intrinsic matrix for rendering depth from occupancy grid (stay fix)
 render_H: 128                                                 # height of the rendered depth image (stay fix)
@@ -26,20 +32,22 @@ voxel_size: 0.1         # size of each voxel in meters
 depth_range: 3.5        # depth range for volume mapping (wavemap) 
 
 # ------ Planning ------ 
-bounds: [-11, 10, -16, 4, 0.4, 1.8]     # bounding box for planning (x_min, x_max, y_min, y_max, z_min, z_max)
+bounds: [-11, 10, -16, 4, 0.2, 0.6]     # bounding box for planning (x_min, x_max, y_min, y_max, z_min, z_max)
 use_free_grid: True                       # enable validatiy check with free grid
 use_occ_grid: True                        # enable validatiy check with occupied grid
 min_dist2occ: 0.2                         # minimum distance to occupied cells to consider a cell as valid
-max_dist2free: 0.075                      # maximum distance to free cells to consider a cell as valid
+max_dist2free: 0.15                       # maximum distance to free cells to consider a cell as valid
 max_planning_time: 1.5                    # maximum planning time (in seconds)
 planning_algo: rrtstar                    # planning algorithm to use(rrt, rrtstar, rrtconnect)
+path_visit_penalty_radius: 0.5            # radius (m) around each robot pose counted as "visited" for path scoring
+path_visit_penalty_weight: 1.0            # strength of visit penalty; 0 = pure shortest-path (requires planning_algo: rrtstar)
 
 # ------ Exploration App ------
-predict_interval: 6                   # interval for predicting frontiers (in loop iterations)           
-plan_interval: 15                     # interval for planning (in loop iterations)   
+detect_interval: 10                   # interval for running frontier detection (in loop iterations)
+plan_interval: 15                     # interval for planning (in loop iterations)
 initial_cam_extrinsic:                # initial camera extrinsic matrix
   - [-0.50000000, 0.86602540, 0.00000000, 5.45262794]
-  - [0.00000000, 0.00000000, -1.00000000, 1.00000000]
+  - [0.00000000, 0.00000000, -1.00000000, 0.40000000]
   - [-0.86602540, -0.50000000, 0.00000000, 7.24422863]
   - [0.00000000, 0.00000000, 0.00000000, 1.00000000]
   

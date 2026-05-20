@@ -10,6 +10,60 @@ from ompl import base as ob
 from ompl import geometric as og
 
 
+class ExplorationCostObjective(ob.OptimizationObjective):
+    """
+    RRT* optimization objective that combines Euclidean path length with a
+    penalty for routing through regions the robot has already visited.
+
+    For a motion segment s1 → s2:
+
+        cost = ||s1 - s2|| × (1 + visit_weight × log1p(n_close(midpoint)))
+
+    where n_close is the number of historical robot positions within
+    visit_radius of the segment midpoint.  The log1p scaling keeps the
+    penalty bounded: a corridor visited 100 times costs ≈5× a fresh one,
+    not 100×.
+
+    motionCostHeuristic returns the plain Euclidean lower bound so RRT*'s
+    asymptotic optimality is preserved.
+
+    Only used when planning_algo = "rrtstar" and visit_weight > 0.
+    """
+
+    def __init__(
+        self,
+        si: ob.SpaceInformation,
+        robot_kdt: "KDTree | None",
+        visit_radius: float,
+        visit_weight: float,
+    ):
+        super().__init__(si)
+        self._robot_kdt = robot_kdt
+        self._visit_radius = float(visit_radius)
+        self._visit_weight = float(visit_weight)
+        self.setCostThreshold(ob.Cost(float("inf")))
+
+    def stateCost(self, state: ob.State) -> ob.Cost:
+        return ob.Cost(0.0)  # cost is accumulated in motionCost
+
+    def motionCost(self, s1: ob.State, s2: ob.State) -> ob.Cost:
+        p1 = np.array([s1[0], s1[1], s1[2]], dtype=float)
+        p2 = np.array([s2[0], s2[1], s2[2]], dtype=float)
+        length = float(np.linalg.norm(p2 - p1))
+        if self._robot_kdt is not None and length > 1e-9:
+            mid = (p1 + p2) * 0.5
+            n_close = len(self._robot_kdt.query_ball_point(mid, self._visit_radius))
+            return ob.Cost(length * (1.0 + self._visit_weight * np.log1p(float(n_close))))
+        return ob.Cost(length)
+
+    def motionCostHeuristic(self, s1: ob.State, s2: ob.State) -> ob.Cost:
+        # Lower bound: Euclidean length only (no visit penalty).
+        # Required for RRT* admissibility / asymptotic optimality.
+        p1 = np.array([s1[0], s1[1], s1[2]], dtype=float)
+        p2 = np.array([s2[0], s2[1], s2[2]], dtype=float)
+        return ob.Cost(float(np.linalg.norm(p2 - p1)))
+
+
 class OccupancyGrid3DPathPlanner:
     """
     3D occupancy-grid-aware path planner using OMPL.
@@ -26,6 +80,9 @@ class OccupancyGrid3DPathPlanner:
 
         self._free_kdt: Optional[KDTree] = None
         self._occ_kdt: Optional[KDTree] = None
+        self._visit_kdt: Optional[KDTree] = None
+        self._visit_radius: float = float(params.get("path_visit_penalty_radius", 0.5))
+        self._visit_weight: float = float(params.get("path_visit_penalty_weight", 0.0))
 
         self._use_freegrid: bool = bool(params.get("use_free_grid", False))
         self._use_occgrid: bool = bool(params.get("use_occ_grid", False))
@@ -145,6 +202,13 @@ class OccupancyGrid3DPathPlanner:
         bounds.setHigh(2, hz)
         self.sp.setBounds(bounds)
 
+    def set_visit_data(self, robot_positions: Optional[np.ndarray]) -> None:
+        """Build a KDTree from historical robot positions for visit-penalty scoring."""
+        if robot_positions is not None and len(robot_positions) > 0:
+            self._visit_kdt = KDTree(np.asarray(robot_positions, dtype=float))
+        else:
+            self._visit_kdt = None
+
     def update_space(
         self, free_vx: Optional[np.ndarray] = None, occ_vx: Optional[np.ndarray] = None
     ) -> None:
@@ -235,6 +299,13 @@ class OccupancyGrid3DPathPlanner:
 
         if method == "rrtstar":
             planner = og.RRTstar(si)
+            if self._visit_weight > 0.0 and self._visit_kdt is not None:
+                obj = ExplorationCostObjective(
+                    si, self._visit_kdt, self._visit_radius, self._visit_weight
+                )
+            else:
+                obj = ob.PathLengthOptimizationObjective(si)
+            self.ss.setOptimizationObjective(obj)
         elif method == "rrtconnect":
             planner = og.RRTConnect(si)
         elif method == "rrt":
@@ -353,6 +424,27 @@ class OccupancyGrid3DPathPlanner:
             else:
                 # Avoid duplicating previous endpoint
                 dense.extend(seg[1:])
+
+        # Override every intermediate orientation so the camera always faces
+        # its actual direction of motion.  Without this the SLERP between
+        # consecutive coarse-waypoint orientations causes the camera to rotate
+        # toward the *next* segment while still travelling along the current one,
+        # producing a visible misalignment between camera heading and trajectory.
+        # The final pose keeps goal_quat so the camera faces the frontier.
+        for i in range(len(dense) - 1):
+            direction = np.asarray(dense[i + 1]["pos"], dtype=float) \
+                      - np.asarray(dense[i]["pos"], dtype=float)
+            norm = float(np.linalg.norm(direction))
+            if norm > 1e-8:
+                direction /= norm
+                t_mat = compute_alignment_transforms(
+                    origins=[dense[i]["pos"]],
+                    align_vec=direction,
+                    align_axis=[0, 0, 1],
+                    appr_vec=[0, 0, -1],
+                    appr_axis=[0, 1, 0],
+                )[0]
+                dense[i]["quat"] = pose2posquat(t_mat)["quat"]
 
         self.solution = dense
         return self.solution

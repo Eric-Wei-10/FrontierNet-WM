@@ -457,7 +457,11 @@ class FrontierDetector(Base):
             List of Frontier objects (one per accepted slot), or None if no
             slots exceed the confidence threshold.
         """
-        from frontier.model.predict import predict_detr_from_img
+        from frontier.model.predict import (
+            predict_detr_from_img,
+            predict_factory_detr_from_img,
+            DETR_MODEL_TYPES,
+        )
 
         H, W = rgb.shape[:2]
         # Compute scaled intrinsics for back-projection at model resolution
@@ -473,12 +477,20 @@ class FrontierDetector(Base):
         )
 
         # --- Inference ---
-        uv_np, z_np, conf_np, weight_np, occ_np, depth_np = predict_detr_from_img(
-            net=self.model,
-            rgb_img=rgb,
-            device=self.device,
-            input_img_size=self.img_size_model,
-        )
+        if self.model_type in ("detr", "cond_detr"):
+            uv_np, z_np, conf_np, weight_np, occ_np, depth_np = predict_factory_detr_from_img(
+                net=self.model,
+                rgb_img=rgb,
+                device=self.device,
+                input_img_size=self.img_size_model,
+            )
+        else:  # unet_detr
+            uv_np, z_np, conf_np, weight_np, occ_np, depth_np = predict_detr_from_img(
+                net=self.model,
+                rgb_img=rgb,
+                device=self.device,
+                input_img_size=self.img_size_model,
+            )
         # Store raw inputs and aux depth for debug visualisation
         self.raw_rgb = rgb
         self.detr_depth_pred: Optional[np.ndarray] = depth_np  # (model_H, model_W) or None
