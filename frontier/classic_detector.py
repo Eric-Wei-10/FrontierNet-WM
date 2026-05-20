@@ -168,62 +168,31 @@ class ClassicFrontierDetector:
         cluster_pts: np.ndarray,
         cam_pos: np.ndarray,
         W_T_C: np.ndarray,
-        retreat_dist: float = 0.3,
     ) -> Optional[Frontier]:
-        """Build one Frontier from a cluster of frontier voxels.
-
-        Two adjustments are made so the frontier goal survives the
-        FrontierManager's downstream filters (which were designed for
-        neural-network outputs, not classic map-based frontiers):
-
-        1. Goal position retreated toward robot:
-           Classic frontier voxels sit right on the free/unknown boundary,
-           ~0.1 m from the nearest occupied mesh voxel.  The manager's
-           isoccupied() filter rejects points within min_dist2occ=0.2 m of
-           occupied voxels, so we pull the centroid `retreat_dist` metres
-           toward the robot in XY to move it safely inside free space.
-
-        2. View direction projected to XY plane:
-           The filter_max_vd_z=0.65 filter was designed for neural-network
-           frontiers that sometimes predict straight up/down.  Classic
-           frontiers are always horizontal goals, so we zero out vd_z to
-           ensure the filter is never triggered.
-        """
+        """Build one Frontier from a cluster of frontier voxels."""
         centroid = cluster_pts.mean(axis=0).astype(np.float64)
 
-        # Horizontal direction from frontier toward robot (retreat direction)
-        to_robot_xy = np.array([cam_pos[0] - centroid[0],
-                                cam_pos[1] - centroid[1], 0.0])
-        to_robot_norm = float(np.linalg.norm(to_robot_xy))
-
-        if to_robot_norm < 1e-6:
+        # View direction: camera → frontier centroid (unit vector)
+        vd = centroid - cam_pos
+        vd_norm = float(np.linalg.norm(vd))
+        if vd_norm < 1e-6:
             return None
-
-        to_robot_xy /= to_robot_norm
-
-        # Fix 1: retreat centroid toward robot to clear occupied-proximity filter
-        goal = centroid.copy()
-        goal[:2] += to_robot_xy[:2] * retreat_dist
-
-        # Fix 2: horizontal-only view direction (camera → frontier, Z zeroed)
-        vd_xy = -to_robot_xy.copy()   # frontier direction = away from robot
-        vd_xy[2] = 0.0
-        vd_xy /= float(np.linalg.norm(vd_xy) + 1e-9)
+        vd /= vd_norm
 
         # Gain = cluster size (proxy for unexplored volume behind frontier)
         gain = float(len(cluster_pts))
 
         # 2-D viewing angle in XY plane
-        direct_angle = float(np.arctan2(vd_xy[1], vd_xy[0]))
+        direct_angle = float(np.arctan2(vd[1], vd[0]))
 
-        # Approximate pixel coordinates (use original centroid for projection)
+        # Approximate pixel coordinates
         pixel_pos = self._project_to_pixel(centroid, W_T_C)
 
         f = Frontier()
-        f.pos3d = goal
+        f.pos3d = centroid
         f.gain = gain
         f.u_gain = gain
-        f.view_direction = vd_xy
+        f.view_direction = vd
         f.direct_angle = direct_angle
         f.pixel_pos = pixel_pos
         f.set_valid()

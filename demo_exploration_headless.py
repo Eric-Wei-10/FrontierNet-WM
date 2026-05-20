@@ -658,28 +658,18 @@ class HeadlessExplorerApp:
                     )
                 elif self.args.model_type == "mapex":
                     # MapEx baseline: LaMa inpainting ensemble on a 2-D top-down
-                    # occupancy map.  We always interpolate the wavemap here so
-                    # the detector sees the latest partial observations even when
-                    # --voxel_grid provides the planning map.
+                    # occupancy map built from the wavemap's currently-observed
+                    # points.  The global voxel grid (global_free_pts) is only
+                    # for the path planner — feeding the full pre-loaded scene to
+                    # MapEx would leave no unknown interior for LaMa to inpaint.
                     self.mapper.interpolate_occupancy_grid()
                     og = self.mapper.get_occupancy_grid()
-                    # Use global map if voxel_grid was provided; otherwise wavemap
-                    free_for_mapex = (
-                        self.global_free_pts
-                        if (self.args.voxel_grid and self.global_free_pts is not None)
-                        else og["free"]
-                    )
-                    occ_for_mapex = (
-                        self.global_occ_pts
-                        if (self.args.voxel_grid and self.global_occ_pts is not None)
-                        else og["occupied"]
-                    )
                     # Height filter: keep voxels within ±1.5 m of the camera
                     cam_z = float(W_T_C[2, 3])
                     z_filter = (cam_z - 1.5, cam_z + 0.8)
                     ft_list = self.mapex_detector.detect(
-                        free_pts=free_for_mapex,
-                        occ_pts=occ_for_mapex,
+                        free_pts=og["free"],
+                        occ_pts=og["occupied"],
                         W_T_C=W_T_C,
                         z_filter=z_filter,
                     )
@@ -836,7 +826,11 @@ class HeadlessExplorerApp:
                             self.path_to_go = []
                             self.move_enough = True
 
-        # Final state output
+        # Final state output — write JSON once here regardless of how the loop
+        # exited (early break on 0 frontiers, max-steps, or max-time).
+        if self.json_path:
+            logging.info(f"Writing final state to {self.json_path}")
+            self.ft_manager.write_to_file(file_path=self.json_path)
         logging.info("Exploration finished, total steps: %d", n_robot_poses)
 
     # ---------- motion & mapping ----------

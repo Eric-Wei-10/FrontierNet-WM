@@ -27,7 +27,9 @@ SCENE=${1:?"Usage: $0 <scene> <pt>"}
 PT=${2:?"Usage: $0 <scene> <pt>"}
 
 ROOT=/cluster/project/cvg/students/shangwu/FrontierNet
-CONFIG=${ROOT}/config/${SCENE}/pt_${PT}/classic.yaml
+# Reuse per-scene DETR config: same starting pose and planning bounds,
+# classic detector ignores any model-specific keys.
+CONFIG=${ROOT}/config/${SCENE}/pt_${PT}/detr.yaml
 SCENE_PAD=$(printf "%06d" "${SCENE}")
 MESH=${ROOT}/eval_data/mesh/${SCENE_PAD}.glb
 VOXEL_GRID=${ROOT}/eval_data/voxel_grid/${SCENE_PAD}-voxel_grid.ply
@@ -37,7 +39,7 @@ NAME=classic_${SCENE}_pt${PT}
 if [[ ! -f "${CONFIG}" ]]; then
     echo "ERROR: config not found: ${CONFIG}"
     echo "  Available poses for scene ${SCENE}:"
-    ls "${ROOT}/config/${SCENE}/pt_"*/classic.yaml 2>/dev/null | sed 's|.*/pt_||;s|/.*||' | xargs echo "  pt:"
+    ls "${ROOT}/config/${SCENE}/pt_"*/detr.yaml 2>/dev/null | sed 's|.*/pt_||;s|/.*||' | xargs echo "  pt:"
     exit 1
 fi
 if [[ ! -f "${MESH}" ]]; then
