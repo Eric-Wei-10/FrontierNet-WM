@@ -970,7 +970,7 @@ class FrontierManager(Base):
         bbox = self.filter_bbox
         min_gain = float(self.filter_min_gain)
         max_vd_z = self.filter_max_vd_z
-        check_occ = self.occ_map is not None
+        check_occ = False  # occupied-proximity filter removed
 
         # graveyard_arr is kept mutable during the loop (fix defect 6): when a
         # frontier is gain-filtered with n_close>0 its position is appended to
@@ -1101,12 +1101,6 @@ class FrontierManager(Base):
                     self.logger.debug(f"Frontier {fid} invalid (|vd_z|>{max_vd_z}).")
                     continue
 
-            # 4) Too close to occupied space
-            if check_occ and self.planner.isoccupied(ft.pos3d):
-                ft.set_invalid()
-                n_occ_removed += 1
-                self.logger.debug(f"Frontier {fid} invalid (near occupied).")
-                continue
 
             # 5) Too close to a graveyard entry (previously removed frontier location)
             if graveyard_arr is not None:
@@ -1178,8 +1172,7 @@ class FrontierManager(Base):
         n_after_gain = n_after_bbox - n_gain_removed
         n_after_nclose = n_after_gain - n_nclose_removed
         n_after_vdz = n_after_nclose - n_vdz_removed
-        n_after_occ = n_after_vdz - n_occ_removed
-        n_after_grave = n_after_occ - n_grave_removed
+        n_after_grave = n_after_vdz - n_grave_removed
         n_after_det_grave = n_after_grave - n_det_grave_removed
         n_after_freespace = n_after_det_grave - n_freespace_removed
         n_after_nav = n_after_freespace - n_nav_removed

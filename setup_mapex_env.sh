@@ -7,26 +7,25 @@
 #SBATCH --time=2:00:00
 #SBATCH --account=ls_polle
 
-# Set up MapEx (https://github.com/castacks/MapEx) as a baseline.
+# Set up the MapEx baseline environment.
+#
+# Strategy: clone ftnet_inference_env_2 (which already has open3d, pywavemap,
+# ompl, unik3d, hdbscan, etc.) and layer the LaMa/MapEx-specific packages
+# (hydra-core, omegaconf, pytorch-lightning, kornia, …) on top.
+# pywavemap has no Python-3.10 wheel so this avoids rebuilding from scratch.
 #
 # Usage (interactive):  bash setup_mapex_env.sh
 # Usage (sbatch):       sbatch setup_mapex_env.sh
 #
-# What this does:
-#   1. Clones MapEx + lama submodule to MAPEX_DIR
-#   2. Creates a conda env at ENV_DIR (Python 3.10 + CUDA 12.1-compatible PyTorch)
-#   3. Installs all LaMa inference dependencies
-#   4. Builds range_libc from source (needed for MapEx raycasting)
-#   5. Installs pyastar2d and numba
-#
-# After this script, manually download the pretrained LaMa weights
-# (see "Model download" section at the bottom of this script's output).
+# After this script, manually download the pretrained LaMa ensemble weights
+# (see "Model download" note at the bottom of this script's output).
 
 module load eth_proxy
 
 set -euo pipefail
 
 MAPEX_DIR=/cluster/project/cvg/students/shangwu/MapEx
+BASE_ENV=/cluster/project/cvg/students/shangwu/ftnet_inference_env_2
 ENV_DIR=/cluster/project/cvg/students/shangwu/mapex_env
 
 # ---------------------------------------------------------------------------
@@ -38,112 +37,157 @@ echo "================================================================"
 
 if [[ -d "${MAPEX_DIR}/.git" ]]; then
     echo "MapEx already cloned at ${MAPEX_DIR} — updating submodules"
-    cd "${MAPEX_DIR}"
-    git submodule update --init --recursive
+    git -C "${MAPEX_DIR}" submodule update --init --recursive
 else
     git clone --recurse-submodules https://github.com/castacks/MapEx.git "${MAPEX_DIR}"
-    cd "${MAPEX_DIR}"
 fi
 
-echo "MapEx at: $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
+echo "MapEx at: $(git -C "${MAPEX_DIR}" rev-parse --short HEAD)"
 
 # ---------------------------------------------------------------------------
-# 2. Create conda environment
+# 2. Create conda environment (clone from ftnet_inference_env_2)
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo " Step 2: Create conda environment at ${ENV_DIR}"
+echo " Step 2: Clone ${BASE_ENV} → ${ENV_DIR}"
 echo "================================================================"
 
 source ~/miniconda3/etc/profile.d/conda.sh
 
 if [[ -d "${ENV_DIR}" ]]; then
-    echo "Environment already exists — skipping creation"
+    echo "Environment already exists at ${ENV_DIR} — skipping clone"
 else
-    conda create -y -p "${ENV_DIR}" python=3.10
+    conda create --clone "${BASE_ENV}" -p "${ENV_DIR}"
 fi
 
 conda activate "${ENV_DIR}"
 
 # ---------------------------------------------------------------------------
-# 3. Install PyTorch (CUDA 12.1 wheels are forward-compatible with CUDA 12.8)
-# ---------------------------------------------------------------------------
-echo ""
-echo "================================================================"
-echo " Step 3: Install PyTorch 2.1 + CUDA 12.1"
-echo "================================================================"
-
-pip install torch==2.1.2 torchvision==0.16.2 \
-    --index-url https://download.pytorch.org/whl/cu121
-
-# ---------------------------------------------------------------------------
-# 4. Install LaMa inference dependencies
+# 3. Install LaMa inference dependencies
 #
-# Version notes vs the original lama conda_env.yml (Python 3.6 / CUDA 10.2):
-#   hydra-core 1.1.2  — keeps lama's conf/ format (1.x Structured Configs)
-#   omegaconf  2.1.2  — required by hydra-core 1.1.x (range: >=2.1.1, <2.2)
-#   pytorch-lightning 1.9.5  — last 1.x release; checkpoint dict compatible
-#                              with weights trained on 1.2.9
-#   kornia 0.6.12     — last 0.6.x; API stable vs 0.5.0, works with torch 2.x
-#   albumentations 1.3.1  — modern Python-compatible; original 0.5.2 API is
-#                           only used in LaMa training augments, not inference
+# The cloned env already provides: torch, numpy, open3d, pywavemap, ompl,
+# unik3d, hdbscan, segmentation-models-pytorch, albumentations, wandb, etc.
+#
+# We add only what LaMa's inference pipeline additionally requires:
+#   hydra-core 1.1.2       — LaMa conf/ uses Hydra 1.x Structured Configs
+#   omegaconf  2.1.2       — required by hydra-core 1.1.x (>=2.1.1,<2.2)
+#   pytorch-lightning 1.9.5 — checkpoint dict matches LaMa training (1.2.9)
+#   kornia 0.6.12          — LaMa uses kornia; cloned env doesn't have it
+#   setuptools<71          — pkg_resources still needed by lightning_fabric
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo " Step 4: Install LaMa inference dependencies"
+echo " Step 3: Install LaMa inference dependencies"
 echo "================================================================"
 
-pip install \
+pip install --no-cache-dir \
     "hydra-core==1.1.2" \
     "omegaconf==2.1.2" \
     "pytorch-lightning==1.9.5" \
     "kornia==0.6.12" \
-    "albumentations==1.3.1" \
-    "imageio==2.31.6" \
-    "scikit-image==0.22.0" \
-    "scikit-learn==1.3.2" \
-    "scipy==1.11.4" \
-    "pandas==2.1.4" \
-    "matplotlib==3.8.2" \
-    "tqdm" \
-    "pillow>=10.0.0" \
-    "pyyaml" \
-    "tabulate" \
+    "scikit-image" \
+    "imageio" \
     "braceexpand" \
-    "opencv-python-headless==4.9.0.80" \
     "webdataset" \
-    "easydict"
+    "easydict" \
+    "setuptools<71"
 
-# lama has no setup.py — add it to sys.path via a .pth file so
-# 'import saicinpainting' resolves in this env
+# lama has no setup.py — add it to sys.path via a .pth file
 SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])")
 echo "${MAPEX_DIR}/lama" > "${SITE_PKG}/mapex_lama.pth"
 echo "Added lama to sys.path via ${SITE_PKG}/mapex_lama.pth"
 
 # ---------------------------------------------------------------------------
-# 5. MapEx-specific: range_libc, pyastar2d, numba
+# 4. Patch LaMa source for compatibility with modern Python packages
+#
+#  aug.py        : albumentations 1.2+ removed imgaug-based DualIAATransform
+#                  (training-only; stub it out so inference still works)
+#  fake_fakes.py : kornia 0.6.x moved SamplePadding to kornia.constants
+#  trainers/__init__.py : torch 2.6+ changed torch.load default to
+#                  weights_only=True, which rejects LaMa's checkpoint format
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo " Step 5: Build range_libc + install pyastar2d / numba"
+echo " Step 4: Patch LaMa source"
 echo "================================================================"
 
-# range_libc needs Cython at build time
-pip install "cython==3.0.10"
+AUG_PY="${MAPEX_DIR}/lama/saicinpainting/training/data/aug.py"
+if ! grep -q "_HAVE_IAA" "${AUG_PY}"; then
+python - "${AUG_PY}" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    src = f.read()
+old = "from albumentations import DualIAATransform, to_tuple\nimport imgaug.augmenters as iaa"
+new = (
+    "try:\n"
+    "    from albumentations import DualIAATransform, to_tuple\n"
+    "    import imgaug.augmenters as iaa\n"
+    "    _HAVE_IAA = True\n"
+    "except ImportError:\n"
+    "    _HAVE_IAA = False\n"
+    "    class DualIAATransform:\n"
+    "        def __init__(self, *a, **kw):\n"
+    "            raise NotImplementedError('imgaug transforms unavailable')\n"
+    "    def to_tuple(x, low=None):\n"
+    "        if isinstance(x, (tuple, list)):\n"
+    "            return tuple(x)\n"
+    "        return (x, x) if low is None else (low, x)"
+)
+with open(path, 'w') as f:
+    f.write(src.replace(old, new, 1))
+print(f"Patched {path}")
+PYEOF
+else
+    echo "aug.py already patched"
+fi
 
-cd "${MAPEX_DIR}/range_libc/pywrapper"
-python setup.py install
+FF_PY="${MAPEX_DIR}/lama/saicinpainting/training/modules/fake_fakes.py"
+if ! grep -q "kornia.constants" "${FF_PY}"; then
+python - "${FF_PY}" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    src = f.read()
+old = "from kornia import SamplePadding"
+new = (
+    "try:\n"
+    "    from kornia import SamplePadding\n"
+    "except ImportError:\n"
+    "    from kornia.constants import SamplePadding"
+)
+with open(path, 'w') as f:
+    f.write(src.replace(old, new, 1))
+print(f"Patched {path}")
+PYEOF
+else
+    echo "fake_fakes.py already patched"
+fi
 
-pip install pyastar2d
-conda install -y -c conda-forge numba
+TRAINERS_PY="${MAPEX_DIR}/lama/saicinpainting/training/trainers/__init__.py"
+if ! grep -q "weights_only=False" "${TRAINERS_PY}"; then
+python - "${TRAINERS_PY}" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    src = f.read()
+old = "state = torch.load(path, map_location=map_location)"
+new = "state = torch.load(path, map_location=map_location, weights_only=False)"
+with open(path, 'w') as f:
+    f.write(src.replace(old, new, 1))
+print(f"Patched {path}")
+PYEOF
+else
+    echo "trainers/__init__.py already patched"
+fi
 
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo " Setup complete!"
-echo " Activate with:  conda activate ${ENV_DIR}"
+echo " Setup complete!  Activate with:"
+echo "   conda activate ${ENV_DIR}"
 echo "================================================================"
 echo ""
 echo " *** Model download (manual step) ***"
@@ -153,7 +197,4 @@ echo " extract them so the directory looks like:"
 echo ""
 echo "   ${MAPEX_DIR}/pretrained_models/weights/big_lama/models/best.ckpt"
 echo "   ${MAPEX_DIR}/pretrained_models/weights/lama_ensemble/train_1-3/models/best.ckpt"
-echo ""
-echo " Then symlink or copy into the expected location:"
-echo "   ln -s ${MAPEX_DIR}/pretrained_models/weights  ${MAPEX_DIR}/weights"
 echo "================================================================"

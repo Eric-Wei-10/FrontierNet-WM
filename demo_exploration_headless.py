@@ -28,6 +28,7 @@ from utils.vis_utils import (
 # FrontierNet
 from frontier.detector import FrontierDetector
 from frontier.classic_detector import ClassicFrontierDetector
+from frontier.mapex_detector import MapExFrontierDetector
 from frontier.model.predict import load_model
 from utils.frontier_utils import read_config_yaml
 
@@ -256,6 +257,7 @@ class HeadlessExplorerApp:
         self.ft_manager: Optional[FrontierManager] = None
         self.ft_detector: Optional[FrontierDetector] = None
         self.classic_detector: Optional[ClassicFrontierDetector] = None
+        self.mapex_detector: Optional[MapExFrontierDetector] = None
         self.VOX_SIZE = (
             self.config["voxel_size"]
             if self.config["voxel_size"] is not None
@@ -645,16 +647,41 @@ class HeadlessExplorerApp:
                 # Frontier detection — branch on model type
                 if self.args.model_type == "classic":
                     # Classic map-based frontier detection (Yamauchi 1997).
-                    # Always interpolate the wavemap at detect steps so we have
-                    # the robot's current observed free/occupied space, regardless
-                    # of whether --voxel_grid is set (the voxel_grid is used only
-                    # for path planning, not for frontier detection).
+                    # Frontiers are detected from wavemap observations only;
+                    # the planner separately uses the full global voxel grid.
                     self.mapper.interpolate_occupancy_grid()
                     og = self.mapper.get_occupancy_grid()
                     ft_list = self.classic_detector.detect(
                         free_pts=og["free"],
                         occ_pts=og["occupied"],
                         W_T_C=W_T_C,
+                    )
+                elif self.args.model_type == "mapex":
+                    # MapEx baseline: LaMa inpainting ensemble on a 2-D top-down
+                    # occupancy map.  We always interpolate the wavemap here so
+                    # the detector sees the latest partial observations even when
+                    # --voxel_grid provides the planning map.
+                    self.mapper.interpolate_occupancy_grid()
+                    og = self.mapper.get_occupancy_grid()
+                    # Use global map if voxel_grid was provided; otherwise wavemap
+                    free_for_mapex = (
+                        self.global_free_pts
+                        if (self.args.voxel_grid and self.global_free_pts is not None)
+                        else og["free"]
+                    )
+                    occ_for_mapex = (
+                        self.global_occ_pts
+                        if (self.args.voxel_grid and self.global_occ_pts is not None)
+                        else og["occupied"]
+                    )
+                    # Height filter: keep voxels within ±1.5 m of the camera
+                    cam_z = float(W_T_C[2, 3])
+                    z_filter = (cam_z - 1.5, cam_z + 0.8)
+                    ft_list = self.mapex_detector.detect(
+                        free_pts=free_for_mapex,
+                        occ_pts=occ_for_mapex,
+                        W_T_C=W_T_C,
+                        z_filter=z_filter,
                     )
                 elif self.args.model_type in {"unet_detr", "detr", "cond_detr"}:
                     # DETR: goals are (u,v,z) 3-D points; GMM weight = info-gain proxy.
@@ -686,7 +713,7 @@ class HeadlessExplorerApp:
 
                 # Add into manager
                 if ft_list:
-                    if self.args.model_type in {"unet_detr", "detr", "cond_detr", "classic"}:
+                    if self.args.model_type in {"unet_detr", "detr", "cond_detr", "classic", "mapex"}:
                         ft_list = self.ft_manager.dedup_new_frontiers(
                             ft_list, radius=self.args.detr_dedup_radius
                         )
@@ -733,7 +760,7 @@ class HeadlessExplorerApp:
                 or bool(ft_list)
             )
             if _gain_inputs_changed:
-                if self.args.model_type in {"unet_detr", "detr", "cond_detr", "classic"}:
+                if self.args.model_type in {"unet_detr", "detr", "cond_detr", "classic", "mapex"}:
                     self.ft_manager.gain_adjustment_detr()
                 else:
                     self.ft_manager.gain_adjustment()
@@ -1019,6 +1046,26 @@ class HeadlessExplorerApp:
                 self.args.classic_cluster_eps,
                 self.args.classic_min_frontier_size,
             )
+        elif model_type == "mapex":
+            # MapEx baseline: LaMa inpainting ensemble on a 2-D top-down map.
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.mapex_detector = MapExFrontierDetector(
+                mapex_dir=self.args.mapex_dir,
+                device=device,
+                map_size=self.args.mapex_map_size,
+                map_margin_m=self.args.mapex_map_margin,
+                min_frontier_size=self.args.mapex_min_frontier_size,
+                gain_scale=self.args.mapex_gain_scale,
+                log_level=self.args.log_level,
+            )
+            logging.info(
+                "MapEx frontier detector initialised "
+                "(map_size=%d, margin=%.1f m, min_ft=%d, gain_scale=%.0f).",
+                self.args.mapex_map_size,
+                self.args.mapex_map_margin,
+                self.args.mapex_min_frontier_size,
+                self.args.mapex_gain_scale,
+            )
         else:
             use_depth = True
             feature_layers = (
@@ -1205,7 +1252,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--model_type",
         type=str,
         default="dpt",
-        choices=["dpt", "unet", "unet_detr", "detr", "cond_detr", "classic"],
+        choices=["dpt", "unet", "unet_detr", "detr", "cond_detr", "classic", "mapex"],
         help=(
             "Model architecture: "
             "'dpt' (ViT+DPT, RGB-only, dense df_seg head), "
@@ -1213,7 +1260,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "'unet_detr' (ResNet34+UNet, RGB-only, sparse DETR head), "
             "'detr' (FrontierDETR: ResNet50+enc+dec, DETR-Factory), "
             "'cond_detr' (FrontierConditionalDETR: ResNet50+enc+cond dec, DETR-Factory), "
-            "'classic' (Yamauchi 1997 map-based, no neural network)"
+            "'classic' (Yamauchi 1997 map-based, no neural network), "
+            "'mapex' (MapEx ICRA-2025: LaMa ensemble on 2-D top-down occupancy map)"
         ),
     )
     p.add_argument(
@@ -1362,6 +1410,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(already-visible) frontiers. Occluded frontiers keep their full gain so "
             "the planner prefers exploring hidden/unseen areas. Default 0.1."
         ),
+    )
+    # --- MapEx args ---
+    p.add_argument(
+        "--mapex_dir",
+        type=str,
+        default="/cluster/project/cvg/students/shangwu/MapEx",
+        help="Path to the MapEx repository root (used when --model_type mapex).",
+    )
+    p.add_argument(
+        "--mapex_map_size",
+        type=int,
+        default=512,
+        help="(mapex) Top-down occupancy map resolution in pixels (must be multiple of 16). "
+             "Default 512.",
+    )
+    p.add_argument(
+        "--mapex_map_margin",
+        type=float,
+        default=3.0,
+        help="(mapex) Metres of unknown padding around the observed bounding box. "
+             "Default 3.0 m.",
+    )
+    p.add_argument(
+        "--mapex_min_frontier_size",
+        type=int,
+        default=10,
+        help="(mapex) Minimum frontier pixel-cluster size to accept. Default 10.",
+    )
+    p.add_argument(
+        "--mapex_gain_scale",
+        type=float,
+        default=1e4,
+        help="(mapex) Multiplier applied to LaMa per-frontier variance to produce "
+             "Frontier.gain (must exceed filter_min_gain). Default 1e4.",
     )
     # --- Classic (Yamauchi 1997) args ---
     p.add_argument(
