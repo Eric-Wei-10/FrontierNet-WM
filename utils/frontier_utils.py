@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -33,8 +34,26 @@ def ft_pos_direct_distance(ft1, ft2, weights=[1, 1]):
 
 
 def read_config_yaml(file_path: str) -> dict:
+    """Load a YAML config, resolving optional ``_base`` inheritance.
+
+    If the loaded file contains a ``_base`` key its value is treated as a path
+    (relative to the file's own directory) to a parent config that is loaded
+    first.  The child's keys are then merged on top, allowing scene or seed
+    configs to specify only the parameters that differ from the base.
+    Inheritance is recursive, so a scene config can itself inherit from a
+    universal base.
+    """
+    file_path = os.path.abspath(file_path)
     with open(file_path, "r") as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+
+    if "_base" in config:
+        base_rel = config.pop("_base")
+        base_abs = os.path.join(os.path.dirname(file_path), base_rel)
+        base_config = read_config_yaml(base_abs)
+        base_config.update(config)
+        config = base_config
+
     return config
 
 

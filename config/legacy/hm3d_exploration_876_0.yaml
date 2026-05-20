@@ -1,0 +1,10 @@
+_base: hm3d_exploration_876_base.yaml
+
+proximity_retirement_radius: 0.5           # tighter than scene default (1.0)
+utility_dist_exponent: 2                   # stronger nearby preference for this seed
+
+initial_cam_extrinsic:                     # seed 0
+  - [-0.76604444, -0.64278761,  0.00000000,  0.29643052]
+  - [ 0.00000000,  0.00000000, -1.00000000,  0.40000000]
+  - [ 0.64278761, -0.76604444,  0.00000000,  0.27904303]
+  - [ 0.00000000,  0.00000000,  0.00000000,  1.00000000]

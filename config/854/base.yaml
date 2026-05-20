@@ -1,0 +1,24 @@
+_base: ../base_wm_exploration.yaml
+
+weight_threshold: 30
+vd_z_threshold: 0.65
+trans_threshold: 0.2
+angle_threshold: 0.86
+use_mono_depth: False
+planner_collision_radius: 0.075
+planner_inv_radius: 0.15
+use_invalid_voxel: True
+max_planning_time: 8.0
+predict_step_interval: 6
+update_vis: True
+
+bbox:
+  - [-20, 20, -20, 20, -0.85, 3.75]
+planner_bbox:
+  - [-20, 20, -20, 20, -0.85, 3.75]
+
+extrinsic_2:
+  - [-0.34342816, -0.93897736, -0.01945816, -4.24689557]
+  - [-0.76818424,  0.29276002, -0.56937206,  4.40159823]
+  - [ 0.54032405, -0.18059095, -0.82184964, 12.82446721]
+  - [ 0.0,          0.0,          0.0,          1.0      ]

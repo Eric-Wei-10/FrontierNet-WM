@@ -268,7 +268,6 @@ class ExplorerApp:
                 self.ft_detector.detect(
                     rgb=rgb,
                     depth=depth,
-                    df_normalizer=self.config["df_normalizer"],
                     df_thr=self.config["df_thr"],
                 )
                 ft_list = self.ft_detector.anchor_fts(depth=depth, extrinsic=C2_T_W)

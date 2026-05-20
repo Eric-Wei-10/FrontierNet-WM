@@ -1,0 +1,31 @@
+_base: ../base_wm_exploration.yaml
+
+# Hierarchical planning variant
+weight_threshold: 100
+vd_z_threshold: 0.65
+trans_threshold: 0.35
+use_mono_depth: False
+planner_collision_radius: 0.06
+use_invalid_voxel: False
+hierarchical_planning: True
+max_planning_time: 5.0
+predict_step_interval: 10
+num_steps_per_move: 15
+
+bbox:
+  - [-6, 7, -2, 15, 0.3, 1.75]
+planner_bbox:
+  - [-6, 7, -2, 15, 0.3, 1.75]
+
+extrinsic_2:
+  - [ 0.003, -1.0,     0.011,  7.508]
+  - [-0.996, -0.004, -0.092,  0.562]
+  - [ 0.092, -0.01,  -0.996, 12.947]
+  - [ 0.0,     0.0,     0.0,     1.0 ]
+
+# All hir poses share this default extrinsic
+extrinsic:
+  - [ 1.00000000e+00, -2.44026804e-16,  0.00000000e+00,  1.99830816e-01]
+  - [ 0.00000000e+00,  0.00000000e+00, -1.00000000e+00,  1.10000000e+00]
+  - [ 2.44026804e-16,  1.00000000e+00, -0.00000000e+00, -2.94185517e-01]
+  - [ 0.00000000e+00,  0.00000000e+00,  0.00000000e+00,  1.00000000e+00]

@@ -13,7 +13,7 @@ FT_EXT_PROB_GAIN_MAX = 1.0
 ## Open3D Basic ##
 def create_camera(H, W, focal):
     fx, fy = focal, focal
-    cx, cy = W / 2.0 - 0.5, H / 2.0 - 0.5
+    cx, cy = W / 2.0, H / 2.0
     return o3d.camera.PinholeCameraIntrinsic(
         width=W, height=H, fx=fx, fy=fy, cx=cx, cy=cy
     )

@@ -54,3 +54,4 @@ data/
 output/
 model_weights/
 *.err
+eval_data/

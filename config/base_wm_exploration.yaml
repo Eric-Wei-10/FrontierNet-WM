@@ -1,0 +1,13 @@
+# ============================================================
+# Universal base config for the WM (wavemap) exploration pipeline
+# Scene configs inherit from this via:
+#   _base: ../base_wm_exploration.yaml
+# ============================================================
+use_topo_planner: False
+depth_range: 3.5
+planner_method: "rrtstar"
+num_steps_per_move: 1
+replan_after_finish_goal: False
+use_occ_voxel_for_weight_update: True
+hierarchical_planning: False
+update_vis: False
