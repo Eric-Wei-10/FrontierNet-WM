@@ -1,4 +1,4 @@
-_base: ../base_detr_exploration.yaml
+_base: ../24base_mapex_exploration.yaml
 
 filter_bbox: [-2, 16, -6.2, 5.8, 0.2, 1.8]
 bounds:      [-2, 16, -6.2, 5.8, 0.2, 1.8]

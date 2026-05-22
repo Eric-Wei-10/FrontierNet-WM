@@ -16,9 +16,6 @@ input_img_size: [320, 320]
 focal_length: 300.0
 
 # ------ Frontier Manager ------
-filter_not_in_freespace: true               # safe only in voxel_grid mode
-freespace_filter_dist: 3.0                  # allow MapEx frontiers up to 3 m from free voxels
-nav_path_filter_radius: 0.1
 filter_max_vd_z: 0.9                        # MapEx frontiers are 2-D lifts; relax z-direction filter
 force_all_frontier_to_xy: false
 filter_min_gain: 1                          # LaMa variance × 1e4 easily exceeds this
@@ -27,13 +24,12 @@ visited_trans_threshold: 0.25
 visited_angle_threshold: 0.4
 visited_gain_reduction_factor: 2000
 
-detr_visited_gain_reduction_factor: 0.2    # same decay as DETR pipeline
-detr_visited_dist_threshold: 1.5           # slightly larger: 2-D frontiers have less z precision
+detr_visited_gain_reduction_factor: 0.7    # 0.2 was too aggressive: nearby frontiers killed at step 0
+detr_visited_dist_threshold: 1.0           # 1.5 was too large: start pose penalised frontiers 1.5 m away
 detr_max_n_close: 5
 
 max_active_frontiers: 20
 graveyard_radius: 0.8
-detection_graveyard_radius: 0.3
 
 utility_gain_factor: 1.0
 utility_dist_exponent: 1.5
@@ -60,7 +56,6 @@ path_visit_penalty_radius: 0.5
 path_visit_penalty_weight: 1.0
 
 # ------ Exploration App ------
-# LaMa inference takes ~0.1 s/call; detect every 15 steps (same cadence as DETR).
+# LaMa inference takes ~0.1 s/call; detect every 5 steps so new frontiers appear before reaching current goal.
 predict_interval: 6
-plan_interval: 15
-detect_interval: 15
+detect_interval: 5

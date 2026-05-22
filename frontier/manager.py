@@ -55,21 +55,8 @@ class FrontierManager(Base):
         self.robot_poses: Dict[int, np.ndarray] = {}
 
         # Graveyard: positions of removed frontiers — blocks re-detection nearby.
-        # Two separate lists with independent radii:
-        #   _graveyard           — planning failures + stuck detection (larger radius)
-        #   _detection_graveyard — robot observation poses from DETR inference steps
-        #                          (smaller radius, prevents re-detecting near current pos)
         self._graveyard: List[np.ndarray] = []
         self.graveyard_radius: float = float(p.get("graveyard_radius", 1.0))
-
-        self._detection_graveyard: List[np.ndarray] = []
-        self.detection_graveyard_radius: float = float(
-            p.get("detection_graveyard_radius", 0.3)
-        )
-
-        # Cache for nav path filter — rebuilt only when robot_poses grows.
-        self._nav_pos_cache: Optional[np.ndarray] = None
-        self._nav_pos_cache_size: int = 0
 
         # Graph/Maps
         self.graph = FrontierGraph(p, log_level=log_level)
@@ -130,25 +117,6 @@ class FrontierManager(Base):
         # happen to land very close to the robot from getting astronomically
         # high utility and permanently out-competing distant high-gain goals.
         self.min_utility_dist = float(p.get("min_utility_dist", 0.5))
-
-        # Filter: remove frontiers not in the free-voxel map (outside walls /
-        # unreachable). Safe to enable only when the free map is pre-loaded and
-        # complete (voxel_grid mode). In incremental wavemap mode, unmapped rooms
-        # are also isfree=False, so enabling this would remove valid frontiers there.
-        self.filter_not_in_freespace: bool = bool(p.get("filter_not_in_freespace", False))
-        # Maximum distance (m) from the nearest free voxel for a frontier to pass
-        # the freespace filter.  0.0 means use planner.isfree() (strict,
-        # ~max_dist2free=0.15 m).  Set to e.g. 3.0 for DETR mode where frontier
-        # positions are back-projected to the *depth* of the target region and
-        # may land beyond the free-space boundary in unexplored/occluded space.
-        self.freespace_filter_dist: float = float(p.get("freespace_filter_dist", 0.0))
-
-        # Filter: remove frontiers within nav_path_filter_radius metres of ANY
-        # navigation waypoint (all robot_poses, dense).  Use a small radius (e.g.
-        # 0.1 m) so only frontiers literally sitting on the traversed path are
-        # removed, without touching valid frontiers slightly off the route.
-        # 0.0 disables this filter.
-        self.nav_path_filter_radius: float = float(p.get("nav_path_filter_radius", 0.0))
 
         # Distance threshold (metres) for the DETR visited-area check in
         # gain_adjustment_detr().  A robot pose within this distance of a frontier's
@@ -253,15 +221,6 @@ class FrontierManager(Base):
         if self.robot_poses:
             return max(self.robot_poses.keys())
         return None
-
-    def add_detection_pose(self, W_T_C: np.ndarray) -> None:
-        """
-        Record the robot observation position (where DETR inference ran) into
-        _detection_graveyard.  This uses a smaller radius than the main graveyard
-        so that only frontiers near the observation point — not the full 0.8 m
-        planning-failure exclusion zone — are blocked.
-        """
-        self._detection_graveyard.append(np.asarray(W_T_C[:3, 3], dtype=float).copy())
 
     @property
     def goal_pose(self) -> np.ndarray | None:
@@ -524,7 +483,7 @@ class FrontierManager(Base):
                 continue
             else:
                 _ft = Frontier()
-                _gains = np.array([max(ft.u_gain, 1e-4) for ft in _fts])
+                _gains = np.array([max(ft.gain if ft.gain is not None else 1e-4, 1e-4) for ft in _fts])
                 _ft.pos3d = np.average(
                     [ft.pos3d for ft in _fts], axis=0, weights=_gains
                 )
@@ -533,8 +492,8 @@ class FrontierManager(Base):
                 _ft.direct_angle = np.average([ft.direct_angle for ft in _fts], axis=0)
                 _ft.pixel_pos = np.average([ft.pixel_pos for ft in _fts], axis=0)
                 _ft.set_valid()
-                _ft.u_gain = _gains.mean()
-                _ft.gain = _gains.mean()
+                _ft.gain = float(np.max(_gains))
+                _ft.u_gain = _ft.gain
                 _ft.id = self._alloc_frontier_id()
                 _ft.parent_ids = list(
                     set([pid for ft in _fts for pid in ft.parent_ids])
@@ -883,24 +842,6 @@ class FrontierManager(Base):
                     )
             kept = survived
 
-        # Step 3b: detection graveyard filter — reject new frontiers near observation poses.
-        # Uses a tighter radius than the main graveyard to avoid blocking frontiers
-        # in unexplored areas just beyond the robot's current observation range.
-        if self._detection_graveyard:
-            det_grave_arr = np.array(self._detection_graveyard, dtype=float)
-            survived2: List[Frontier] = []
-            for ft in kept:
-                pos = np.asarray(ft.pos3d, dtype=float)
-                nearest = float(np.linalg.norm(det_grave_arr - pos, axis=1).min())
-                if nearest > self.detection_graveyard_radius:
-                    survived2.append(ft)
-                else:
-                    self.logger.debug(
-                        "Det-graveyard filter (new): dropped at (%.2f,%.2f,%.2f), nearest=%.2f m",
-                        *pos, nearest,
-                    )
-            kept = survived2
-
         n_dropped = n_in - len(kept)
         if n_dropped:
             self.logger.info(
@@ -977,22 +918,6 @@ class FrontierManager(Base):
         # self._graveyard and graveyard_arr is extended in-place so that
         # subsequent frontiers in the same call are checked against it.
         graveyard_arr = np.array(self._graveyard, dtype=float) if self._graveyard else None
-        detection_graveyard_arr = (
-            np.array(self._detection_graveyard, dtype=float)
-            if self._detection_graveyard else None
-        )
-
-        # Nav path filter: rebuild nav_pos_arr only when robot_poses has grown
-        # (fix defect 3 — avoids O(N*M) rebuild on every filter call).
-        nav_pos_arr = None
-        if self.nav_path_filter_radius > 0 and self.robot_poses:
-            current_size = len(self.robot_poses)
-            if self._nav_pos_cache is None or current_size != self._nav_pos_cache_size:
-                self._nav_pos_cache = np.array(
-                    [pose[:3, 3] for pose in self.robot_poses.values()], dtype=float
-                )
-                self._nav_pos_cache_size = current_size
-            nav_pos_arr = self._nav_pos_cache
 
         # Current robot position for the proximity-retirement check (computed once).
         cur_robot_pos = None
@@ -1005,10 +930,6 @@ class FrontierManager(Base):
 
         n_before = sum(1 for ft in self.frontiers.values() if ft.is_valid)
         self.logger.info(f"[filter] Start: {n_before} valid frontiers")
-        for fid, ft in self.frontiers.items():
-            if ft.is_valid:
-                p = ft.pos3d
-                self.logger.info(f"[filter]   frontier {fid}: pos3d=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})")
 
         n_bbox_removed = 0
         n_prox_removed = 0
@@ -1017,9 +938,6 @@ class FrontierManager(Base):
         n_vdz_removed = 0
         n_occ_removed = 0
         n_grave_removed = 0
-        n_det_grave_removed = 0
-        n_freespace_removed = 0
-        n_nav_removed = 0
 
         for fid, ft in list(self.frontiers.items()):
             if not ft.is_valid:
@@ -1121,58 +1039,6 @@ class FrontierManager(Base):
                     )
                     continue
 
-            # 5b) Too close to a detection graveyard entry (observation position).
-            # Uses a smaller radius than the main graveyard so the exclusion zone
-            # around each observation point doesn't block unexplored areas nearby.
-            if detection_graveyard_arr is not None:
-                nearest_det = float(
-                    np.linalg.norm(
-                        detection_graveyard_arr - np.asarray(ft.pos3d, dtype=float), axis=1
-                    ).min()
-                )
-                if nearest_det <= self.detection_graveyard_radius:
-                    ft.set_invalid()
-                    n_det_grave_removed += 1
-                    self.logger.debug(
-                        "Frontier %d invalid (detection graveyard, nearest=%.2f m).",
-                        fid, nearest_det,
-                    )
-                    continue
-
-            # 6) Not in free navigable space (outside walls / unreachable).
-            # Only meaningful when the free map is pre-loaded and complete, i.e.
-            # voxel_grid mode. Enable via filter_not_in_freespace=True in config.
-            # When freespace_filter_dist > 0, the check is relaxed: reject only
-            # frontiers whose nearest free voxel is farther than that distance.
-            # Use a generous value (e.g. 3.0 m) for DETR mode where frontier
-            # positions land in occluded/unexplored space by design.
-            if self.filter_not_in_freespace and self.planner._free_kdt is not None:
-                if self.freespace_filter_dist > 0.0:
-                    dist_to_free, _ = self.planner._free_kdt.query(ft.pos3d)
-                    is_too_far = float(dist_to_free) > self.freespace_filter_dist
-                else:
-                    is_too_far = not self.planner.isfree(ft.pos3d)
-                if is_too_far:
-                    ft.set_invalid()
-                    n_freespace_removed += 1
-                    self.logger.debug("Frontier %d invalid (not in free space).", fid)
-                    continue
-
-            # 7) Too close to any navigation waypoint (dense traversed path).
-            # Uses all robot_poses at a tight radius to remove frontiers that are
-            # literally sitting on the route the robot has physically travelled.
-            if nav_pos_arr is not None:
-                pos = np.asarray(ft.pos3d, dtype=float)
-                nearest_nav = float(np.linalg.norm(nav_pos_arr - pos, axis=1).min())
-                if nearest_nav < self.nav_path_filter_radius:
-                    ft.set_invalid()
-                    n_nav_removed += 1
-                    self.logger.debug(
-                        "Frontier %d invalid (on nav path, nearest=%.2f m).",
-                        fid, nearest_nav,
-                    )
-                    continue
-
         n_after_prox = n_before - n_prox_removed
         n_after_bbox = n_after_prox - n_bbox_removed
         n_after_gain = n_after_bbox - n_gain_removed
@@ -1180,9 +1046,6 @@ class FrontierManager(Base):
         n_after_vdz = n_after_nclose - n_vdz_removed
         n_after_occ = n_after_vdz - n_occ_removed
         n_after_grave = n_after_occ - n_grave_removed
-        n_after_det_grave = n_after_grave - n_det_grave_removed
-        n_after_freespace = n_after_det_grave - n_freespace_removed
-        n_after_nav = n_after_freespace - n_nav_removed
 
         if n_prox_removed:
             self.logger.info(
@@ -1203,14 +1066,9 @@ class FrontierManager(Base):
             self.logger.info(f"[filter] After occ:        {n_after_occ} valid  (-{n_occ_removed})")
         if self._graveyard:
             self.logger.info(f"[filter] After graveyard:  {n_after_grave} valid  (-{n_grave_removed}, r={self.graveyard_radius:.2f}m)")
-        if self._detection_graveyard:
-            self.logger.info(f"[filter] After det-grave:  {n_after_det_grave} valid  (-{n_det_grave_removed}, r={self.detection_graveyard_radius:.2f}m)")
-        if self.filter_not_in_freespace:
-            self.logger.info(f"[filter] After freespace:  {n_after_freespace} valid  (-{n_freespace_removed})")
-        if nav_pos_arr is not None:
-            self.logger.info(f"[filter] After nav:        {n_after_nav} valid  (-{n_nav_removed}, r={self.nav_path_filter_radius:.2f}m)")
 
-        # 8) Hard cap: retire lowest-utility frontiers when count exceeds max_active_frontiers.
+        # 6) Hard cap: retire lowest-utility frontiers when count exceeds max_active_frontiers.
+        # Record retired positions to the graveyard so they are not immediately re-detected.
         n_cap_removed = 0
         if self.max_active_frontiers > 0:
             valid_now = [
@@ -1222,13 +1080,14 @@ class FrontierManager(Base):
                 for fid, ft in valid_now[:n_retire]:
                     ft.set_invalid()
                     n_cap_removed += 1
+                    self._graveyard.append(np.asarray(ft.pos3d, dtype=float).copy())
             if n_cap_removed:
                 self.logger.info(
                     "[filter] After cap:     %d valid  (-%d, max=%d)",
                     self.max_active_frontiers, n_cap_removed, self.max_active_frontiers,
                 )
 
-        n_final = n_after_nav - n_cap_removed
+        n_final = n_after_grave - n_cap_removed
         self.logger.info(f"[filter] End:   {n_final} valid frontiers remain")
 
         # Purge all marked frontiers (graveyard entries were already written

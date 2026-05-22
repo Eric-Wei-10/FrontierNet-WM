@@ -27,9 +27,8 @@ from utils.vis_utils import (
 
 # FrontierNet
 from frontier.detector import FrontierDetector
-from frontier.classic_detector import ClassicFrontierDetector
 from frontier.mapex_detector import MapExFrontierDetector
-from frontier.model.predict import load_model
+from frontier.model.predict import load_model, DETR_MODEL_TYPES
 from utils.frontier_utils import read_config_yaml
 
 # Mapping
@@ -37,10 +36,6 @@ from mapping.wavemap import WaveMapper
 
 # Frontier Manager
 from frontier.manager import FrontierManager
-
-# mono depth
-from mono_depth.Metric3D import metric_depth_from_rgb as metric_depth_from_rgb_metric3d
-from mono_depth.UniK3D import metric_depth_from_rgb as metric_depth_from_rgb_unik3d
 
 
 class HeadlessRenderer:
@@ -256,7 +251,6 @@ class HeadlessExplorerApp:
         self.mapper: Optional[WaveMapper] = None
         self.ft_manager: Optional[FrontierManager] = None
         self.ft_detector: Optional[FrontierDetector] = None
-        self.classic_detector: Optional[ClassicFrontierDetector] = None
         self.mapex_detector: Optional[MapExFrontierDetector] = None
         self.VOX_SIZE = (
             self.config["voxel_size"]
@@ -326,8 +320,10 @@ class HeadlessExplorerApp:
         if self.depth_source == self.DEPTH_GT:
             depth = self.renderer.capture_depth()
         elif self.depth_source == self.DEPTH_UNIK3D:
+            from mono_depth.UniK3D import metric_depth_from_rgb as metric_depth_from_rgb_unik3d
             depth = metric_depth_from_rgb_unik3d(rgb_input=rgb, intrinsic_mat=K)
         elif self.depth_source == self.DEPTH_M3D:
+            from mono_depth.Metric3D import metric_depth_from_rgb as metric_depth_from_rgb_metric3d
             depth = metric_depth_from_rgb_metric3d(
                 rgb_input=rgb,
                 intrinsic_mat=K,
@@ -350,87 +346,6 @@ class HeadlessExplorerApp:
         return trans_diff[0, 0] > trans_thre or rot_diff[0, 0] > rot_thre
 
     # ---------- debug visualisation ----------
-
-    def _save_debug_image(self) -> None:
-        """
-        Save a side-by-side debug strip after each inference step:
-          RGB | Depth | Distance Field (projected to frame-0) | Frontier Region | Info Gain
-        All panels are resized to the same height and labelled before concatenation.
-        """
-        if self.debug_dir is None or self.ft_detector is None:
-            return
-
-        det = self.ft_detector
-        PANEL_H = 320  # target height for every panel
-
-        def to_colormap(arr: np.ndarray, cmap: int = cv2.COLORMAP_JET) -> np.ndarray:
-            """Normalise a 2-D float array to [0,255] and apply a cv2 colormap."""
-            arr = arr.astype(np.float32)
-            mn, mx = arr.min(), arr.max()
-            normed = ((arr - mn) / (mx - mn) * 255).astype(np.uint8) if mx > mn else np.zeros_like(arr, dtype=np.uint8)
-            return cv2.applyColorMap(normed, cmap)
-
-        def resize_h(img: np.ndarray, h: int) -> np.ndarray:
-            oh, ow = img.shape[:2]
-            return cv2.resize(img, (max(1, int(ow * h / oh)), h))
-
-        def add_label(panel: np.ndarray, title: str) -> np.ndarray:
-            bar = np.zeros((28, panel.shape[1], 3), dtype=np.uint8)
-            cv2.putText(bar, title, (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
-            return np.vstack([bar, panel])
-
-        panels = []
-
-        # 1. RGB (original resolution, uint8)
-        if det.raw_rgb is not None:
-            rgb_bgr = cv2.cvtColor(det.raw_rgb[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR)
-            panels.append(add_label(resize_h(rgb_bgr, PANEL_H), "RGB"))
-
-        # 2. Depth (original resolution, colourised)
-        if det.raw_depth is not None:
-            panels.append(add_label(resize_h(to_colormap(det.raw_depth), PANEL_H), "Depth"))
-
-        # 3a. Raw Distance Field — original model output before disocclusion redistribution
-        if det.df_raw_pre_redist is not None:
-            panels.append(add_label(resize_h(to_colormap(det.df_raw_pre_redist), PANEL_H), "DF raw (pre-redist.)"))
-
-        # 3b. Raw Distance Field — after scattering disocclusion values to visible edge pixels
-        if det.df_raw is not None:
-            panels.append(add_label(resize_h(to_colormap(det.df_raw), PANEL_H), "DF raw (post-redist.)"))
-
-        # 3b. Distance Field projected to frame-0
-        if det.df is not None:
-            panels.append(add_label(resize_h(to_colormap(det.df), PANEL_H), "DF (frame-0)"))
-
-        # 4. Frontier Region (binary mask)
-        if det.ft_region is not None:
-            ft_gray = (det.ft_region * 255).astype(np.uint8)
-            panels.append(add_label(resize_h(cv2.cvtColor(ft_gray, cv2.COLOR_GRAY2BGR), PANEL_H), "FT Region"))
-
-        # 5. Info Gain
-        if det.info_gain is not None:
-            panels.append(add_label(resize_h(to_colormap(det.info_gain), PANEL_H), "Info Gain"))
-
-        # 6. Newly visible at frame-48 — use the disocclusion mask that was already
-        #    computed (with the corrected bilinear-neighbour + dilation coverage) by
-        #    _redistribute_disocclusion_values, so the panel and the redistribution
-        #    always agree on which pixels are disocclusion.
-        if det.disocclusion_mask is not None:
-            newly_visible = (det.disocclusion_mask * 255).astype(np.uint8)
-            panels.append(add_label(
-                resize_h(cv2.cvtColor(newly_visible, cv2.COLOR_GRAY2BGR), PANEL_H),
-                "New@frame-48 (disoccl.)",
-            ))
-
-        if not panels:
-            return
-
-        strip = np.hstack(panels)
-        os.makedirs(self.debug_dir, exist_ok=True)
-        out_path = os.path.join(self.debug_dir, f"step_{self._debug_step:04d}.png")
-        cv2.imwrite(out_path, strip)
-        logging.info("Saved debug image: %s", out_path)
-        self._debug_step += 1
 
     def _save_debug_image_detr(self) -> None:
         """
@@ -546,6 +461,14 @@ class HeadlessExplorerApp:
         self.mapper.insert_depth_to_buffer(depth=depth0, transform=W_T_C)
         logging.info("Initial mapping round started.")
         self.mapper.integrate_from_buffer()
+        # MapEx needs a dense free-space map at step 0; one frame with
+        # scaling_free=0.2 leaves most voxels near 0 log-odds (fragmented,
+        # no connected frontier clusters).  Re-integrate the same frame
+        # several times so log-odds accumulate and the frustum becomes solid.
+        if self.args.model_type == "mapex":
+            for _ in range(9):
+                self.mapper.insert_depth_to_buffer(depth=depth0, transform=W_T_C)
+                self.mapper.integrate_from_buffer()
         if not self.args.voxel_grid:
             self.mapper.interpolate_occupancy_grid()
             og = self.mapper.get_occupancy_grid()
@@ -639,24 +562,10 @@ class HeadlessExplorerApp:
             ft_list = None  # Fix 3: initialise so it's visible outside the detect block
             if should_detect:
                 logging.info("Running frontier detection (step %d).", n_robot_poses)
-                # Record this as an observed pose so the robot_path_filter knows
-                # the robot genuinely observed this location (not just passed by).
-                self.ft_manager.add_detection_pose(W_T_C)
                 rgb, depth = self.get_rgbd()
 
                 # Frontier detection — branch on model type
-                if self.args.model_type == "classic":
-                    # Classic map-based frontier detection (Yamauchi 1997).
-                    # Frontiers are detected from wavemap observations only;
-                    # the planner separately uses the full global voxel grid.
-                    self.mapper.interpolate_occupancy_grid()
-                    og = self.mapper.get_occupancy_grid()
-                    ft_list = self.classic_detector.detect(
-                        free_pts=og["free"],
-                        occ_pts=og["occupied"],
-                        W_T_C=W_T_C,
-                    )
-                elif self.args.model_type == "mapex":
+                if self.args.model_type == "mapex":
                     # MapEx baseline: LaMa inpainting ensemble on a 2-D top-down
                     # occupancy map built from the wavemap's currently-observed
                     # points.  The global voxel grid (global_free_pts) is only
@@ -673,7 +582,7 @@ class HeadlessExplorerApp:
                         W_T_C=W_T_C,
                         z_filter=z_filter,
                     )
-                elif self.args.model_type in {"unet_detr", "detr", "cond_detr"}:
+                elif self.args.model_type in DETR_MODEL_TYPES:
                     # DETR: goals are (u,v,z) 3-D points; GMM weight = info-gain proxy.
                     # Occluded goals are handled transparently by the path planner.
                     ft_list = self.ft_detector.detect_detr(
@@ -684,15 +593,6 @@ class HeadlessExplorerApp:
                         visible_gain_discount=self.args.detr_visible_gain_discount,
                     )
                     self._save_debug_image_detr()
-                else:
-                    # Dense DPT/UNet pipeline
-                    self.ft_detector.detect(
-                        rgb=rgb,
-                        depth=depth,
-                        df_thr=self.config["df_thr"],
-                    )
-                    self._save_debug_image()
-                    ft_list = self.ft_detector.anchor_fts(depth=depth, extrinsic=C_T_W)
 
                 # Clamp frontier z to planning bounds [z_min, z_max]
                 if ft_list and self.config.get("bounds") is not None:
@@ -703,7 +603,7 @@ class HeadlessExplorerApp:
 
                 # Add into manager
                 if ft_list:
-                    if self.args.model_type in {"unet_detr", "detr", "cond_detr", "classic", "mapex"}:
+                    if self.args.model_type in {"detr", "cond_detr", "mapex"}:
                         ft_list = self.ft_manager.dedup_new_frontiers(
                             ft_list, radius=self.args.detr_dedup_radius
                         )
@@ -750,7 +650,7 @@ class HeadlessExplorerApp:
                 or bool(ft_list)
             )
             if _gain_inputs_changed:
-                if self.args.model_type in {"unet_detr", "detr", "cond_detr", "classic", "mapex"}:
+                if self.args.model_type in {"detr", "cond_detr", "mapex"}:
                     self.ft_manager.gain_adjustment_detr()
                 else:
                     self.ft_manager.gain_adjustment()
@@ -1021,26 +921,9 @@ class HeadlessExplorerApp:
         }
         self.mapper = WaveMapper(params=params)
 
-        # FrontierNet detector — either neural network or classic map-based
+        # FrontierNet detector — neural network or map-based baseline
         model_type = self.args.model_type
-        if model_type == "classic":
-            # Classic Yamauchi (1997) frontier detection — no neural network.
-            self.ft_detector = None
-            self.classic_detector = ClassicFrontierDetector(
-                voxel_size=self.VOX_SIZE,
-                camera_intrinsic=intr.intrinsic_matrix.copy(),
-                min_frontier_size=self.args.classic_min_frontier_size,
-                cluster_eps=self.args.classic_cluster_eps,
-                log_level=self.args.log_level,
-            )
-            logging.info(
-                "Classic frontier detector initialised "
-                "(voxel_size=%.2f, cluster_eps=%.2f, min_size=%d).",
-                self.VOX_SIZE,
-                self.args.classic_cluster_eps,
-                self.args.classic_min_frontier_size,
-            )
-        elif model_type == "mapex":
+        if model_type == "mapex":
             # MapEx baseline: LaMa inpainting ensemble on a 2-D top-down map.
             device = "cuda" if torch.cuda.is_available() else "cpu"
             self.mapex_detector = MapExFrontierDetector(
@@ -1050,6 +933,7 @@ class HeadlessExplorerApp:
                 map_margin_m=self.args.mapex_map_margin,
                 min_frontier_size=self.args.mapex_min_frontier_size,
                 gain_scale=self.args.mapex_gain_scale,
+                voxel_size=self.VOX_SIZE,
                 log_level=self.args.log_level,
             )
             logging.info(
@@ -1060,22 +944,11 @@ class HeadlessExplorerApp:
                 self.args.mapex_min_frontier_size,
                 self.args.mapex_gain_scale,
             )
-        else:
-            use_depth = True
-            feature_layers = (
-                [int(x) for x in self.args.vit_feature_layers.split(",")]
-                if self.args.vit_feature_layers
-                else None
-            )
+        elif model_type in DETR_MODEL_TYPES:
             net = load_model(
                 path=self.args.unet_weight,
-                num_classes=self.config["num_classes"],
-                use_depth=use_depth,
                 model_type=model_type,
-                vit_depth=self.args.vit_depth,
-                feature_layers=feature_layers,
                 num_queries=self.args.detr_num_queries,
-                detr_aux_depth=self.args.detr_aux_depth,
                 factory_d_model=self.args.factory_d_model,
                 factory_n_tokens=self.args.factory_n_tokens,
                 factory_n_layers=self.args.factory_n_layers,
@@ -1086,14 +959,13 @@ class HeadlessExplorerApp:
             self.ft_detector = FrontierDetector(
                 model=net,
                 camera_intrinsic=intr.intrinsic_matrix.copy(),
-                use_depth=use_depth,
                 img_size_model=self.config["input_img_size"],
                 device=device,
                 log_level=self.args.log_level,
                 model_type=model_type,
-                disocclusion_only=self.args.disocclusion_only,
-                edge_spread_width=self.args.edge_spread_width,
             )
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
 
         # Frontier Manager
         self.ft_manager = FrontierManager(
@@ -1239,37 +1111,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--unet_weight",
         type=Path,
-        default=Path("model_weights/rgbd_11cls.pth"),
-        help="Path to model weights (UNet or DPT checkpoint)",
+        default=None,
+        help="Path to DETR model checkpoint",
     )
     p.add_argument(
         "--model_type",
         type=str,
-        default="dpt",
-        choices=["dpt", "unet", "unet_detr", "detr", "cond_detr", "classic", "mapex"],
+        default="detr",
+        choices=["detr", "cond_detr", "mapex"],
         help=(
             "Model architecture: "
-            "'dpt' (ViT+DPT, RGB-only, dense df_seg head), "
-            "'unet' (ResNet34+UNet, RGB-D, dense df_seg head), "
-            "'unet_detr' (ResNet34+UNet, RGB-only, sparse DETR head), "
             "'detr' (FrontierDETR: ResNet50+enc+dec, DETR-Factory), "
             "'cond_detr' (FrontierConditionalDETR: ResNet50+enc+cond dec, DETR-Factory), "
-            "'classic' (Yamauchi 1997 map-based, no neural network), "
             "'mapex' (MapEx ICRA-2025: LaMa ensemble on 2-D top-down occupancy map)"
         ),
-    )
-    p.add_argument(
-        "--vit_depth",
-        type=int,
-        default=6,
-        help="(DPT only) Number of ViT transformer layers used during training",
-    )
-    p.add_argument(
-        "--vit_feature_layers",
-        type=str,
-        default="3,4,5",
-        help="(DPT only) Comma-separated ViT layer indices used for DPT fusion, e.g. '4,5,6,7'. "
-             "Defaults to the last min(4, vit_depth) layers.",
     )
     p.add_argument(
         "--depth_source",
@@ -1302,33 +1157,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory to save per-step debug visualisation strips (RGB|Depth|DF|FT|Gain). "
              "Defaults to <json_parent>/debug. Set to empty string to disable.",
     )
-    p.add_argument(
-        "--disocclusion_only",
-        action="store_true",
-        default=False,
-        help="If set, df_raw post-redistribution contains only the pixels that received "
-             "contributions from disocclusion regions; all unmoved (originally covered) "
-             "pixels are zeroed out.",
-    )
-    p.add_argument(
-        "--edge_spread_width",
-        type=int,
-        default=15,
-        help="Width in pixels of the horizontal dilation applied to df_raw after "
-             "disocclusion redistribution (must be odd for symmetric spread; default 20).",
-    )
-    # --- DETR-specific args (unet_detr mode only) ---
+    # --- DETR-specific args ---
     p.add_argument(
         "--detr_conf_thresh",
         type=float,
         default=0.3,
-        help="(unet_detr) Minimum slot confidence to accept as a frontier candidate.",
+        help="Minimum slot confidence to accept as a frontier candidate.",
     )
     p.add_argument(
         "--detr_num_queries",
         type=int,
         default=10,
-        help="(unet_detr / detr / cond_detr) Number of DETR slot queries (must match the trained checkpoint).",
+        help="Number of DETR slot queries (must match the trained checkpoint).",
     )
     p.add_argument(
         "--factory_d_model",
@@ -1364,25 +1204,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="(detr / cond_detr) Dropout rate in transformer layers. Must match training. Default 0.1.",
     )
     p.add_argument(
-        "--detr_aux_depth",
-        action="store_true",
-        default=False,
-        help=(
-            "(unet_detr) Set this flag when the checkpoint was trained with an "
-            "auxiliary dense depth supervision head (detr_aux_depth=True in "
-            "TwoHeadUnet). Must match the training configuration so the state-dict "
-            "keys align; also enables the aux-depth panel in debug images."
-        ),
-    )
-    p.add_argument(
         "--detr_gain_scale",
         type=float,
         default=100.0,
         help=(
-            "(unet_detr) Multiplicative scale applied to the raw GMM weight before "
-            "it is stored as frontier gain.  The dense pipeline produces gains in "
-            "[~1, 9] (midpoint × 10); set this so DETR weights pass filter_min_gain. "
-            "Default 10.0."
+            "Multiplicative scale applied to the raw GMM weight before "
+            "it is stored as frontier gain. Default 100.0."
         ),
     )
     p.add_argument(
@@ -1390,7 +1217,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help=(
-            "(unet_detr) Exclusion radius in metres for cross-frame deduplication. "
+            "Exclusion radius in metres for cross-frame deduplication. "
             "A newly detected frontier is dropped if any existing valid frontier "
             "lies within this distance. Default 0.5 m."
         ),
@@ -1400,7 +1227,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help=(
-            "(unet_detr) Multiplicative discount applied to the gain of non-occluded "
+            "Multiplicative discount applied to the gain of non-occluded "
             "(already-visible) frontiers. Occluded frontiers keep their full gain so "
             "the planner prefers exploring hidden/unseen areas. Default 0.1."
         ),
@@ -1438,26 +1265,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1e4,
         help="(mapex) Multiplier applied to LaMa per-frontier variance to produce "
              "Frontier.gain (must exceed filter_min_gain). Default 1e4.",
-    )
-    # --- Classic (Yamauchi 1997) args ---
-    p.add_argument(
-        "--classic_min_frontier_size",
-        type=int,
-        default=5,
-        help=(
-            "(classic) Minimum number of frontier voxels in a DBSCAN cluster to be "
-            "accepted as a valid frontier. Smaller clusters are treated as noise. "
-            "Default 5."
-        ),
-    )
-    p.add_argument(
-        "--classic_cluster_eps",
-        type=float,
-        default=0.4,
-        help=(
-            "(classic) DBSCAN neighbourhood radius (metres) for clustering frontier "
-            "voxels into frontier regions. Default 0.4 m."
-        ),
     )
     return p
 

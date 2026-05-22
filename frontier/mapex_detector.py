@@ -47,24 +47,9 @@ class MapExFrontierDetector:
         map_margin_m: float = 3.0,  # extra metres of unknown border beyond observed extent
         min_frontier_size: int = 10,
         gain_scale: float = 1e4,    # scale raw variance [0-0.083] → gain; floor is 2 × filter_min_gain
+        voxel_size: float = 0.1,    # wavemap voxel resolution (m); m_per_px is clamped to this minimum
         log_level: int = logging.INFO,
     ):
-        """
-        Args:
-            mapex_dir:         Root of the MapEx clone
-                               (contains scripts/ and pretrained_models/).
-            device:            "cuda" or "cpu".
-            map_size:          Pixel size of the square top-down map fed to LaMa.
-                               Must be a multiple of 16.  Default 512.
-            map_margin_m:      Metres of unknown padding around the observed
-                               bounding box.  Larger values let LaMa hallucinate
-                               more of the unseen environment.
-            min_frontier_size: Minimum pixel-cluster size to accept as a frontier.
-            gain_scale:        Multiplier for the per-frontier LaMa variance before
-                               it is stored as Frontier.gain.  Ensures gains pass
-                               filter_min_gain (default 1 in the config).
-            log_level:         Python logging level.
-        """
         assert map_size % 16 == 0, f"map_size must be a multiple of 16, got {map_size}"
 
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -75,6 +60,7 @@ class MapExFrontierDetector:
         self.map_margin_m = map_margin_m
         self.min_frontier_size = min_frontier_size
         self.gain_scale = gain_scale
+        self.voxel_size = voxel_size
 
         # Make MapEx/scripts importable so lama_pred_utils resolves.
         scripts_dir = str(Path(mapex_dir) / "scripts")
@@ -94,7 +80,16 @@ class MapExFrontierDetector:
         ]
 
         self.logger.info("Loading 3 LaMa ensemble models from %s …", weights_dir)
-        self._models = [load_lama_model(d, device=device) for d in ensemble_dirs]
+        # Suppress verbose pytorch-lightning model-summary output during load.
+        _noisy = ["pytorch_lightning", "lightning", "saicinpainting", "lightning.pytorch"]
+        _saved = {n: logging.getLogger(n).level for n in _noisy}
+        for n in _noisy:
+            logging.getLogger(n).setLevel(logging.WARNING)
+        try:
+            self._models = [load_lama_model(d, device=device) for d in ensemble_dirs]
+        finally:
+            for n, lvl in _saved.items():
+                logging.getLogger(n).setLevel(lvl)
         # default_map_eval: pads image to nearest multiple of 16, converts to float.
         # For map_size=512 (already ×16) no padding is needed.
         self._transform = get_lama_transform("default_map_eval", map_size)
@@ -206,7 +201,9 @@ class MapExFrontierDetector:
 
         x_min = cx - half
         y_min = cy - half
-        m_per_px = (2.0 * half) / self.map_size
+        # Clamp so adjacent voxels (spaced self.voxel_size apart) map to
+        # adjacent pixels rather than skipping pixels and forming isolated dots.
+        m_per_px = max((2.0 * half) / self.map_size, self.voxel_size)
         origin_xy = np.array([x_min, y_min], dtype=np.float64)
 
         obs_map = np.full((self.map_size, self.map_size), self.UNK, dtype=np.float32)

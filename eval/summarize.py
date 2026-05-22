@@ -44,6 +44,8 @@ def main():
     ap.add_argument("--scene", default="", help="Scene label for display")
     ap.add_argument("--verbose", action="store_true",
                     help="Print per-run breakdown")
+    ap.add_argument("--save", default=None,
+                    help="Write metrics JSON to this path (parent dirs created automatically)")
     args = ap.parse_args()
 
     files = sorted(Path(".").glob(args.json_glob))
@@ -53,11 +55,13 @@ def main():
 
     total_vol, voxel_size, n_vox = load_total_volume(args.voxel_grid)
     ratios: List[float] = []
+    runs: List[dict] = []
 
     for f in files:
         vol = final_mapped_vol(f)
         ratio = vol / total_vol if total_vol > 0 else 0.0
         ratios.append(ratio)
+        runs.append({"name": f.parent.name, "coverage": round(ratio, 6), "mapped_vol_m3": round(vol, 4)})
         if args.verbose:
             print(f"  {f.parent.name}: {ratio:.2%}  ({vol:.3f} / {total_vol:.3f} m³)")
 
@@ -73,6 +77,25 @@ def main():
     print(f"  Min / Max      : {min(ratios):.2%} / {max(ratios):.2%}")
     print(f"  Median         : {np.median(ratios):.2%}")
     print(f"{'='*52}\n")
+
+    if args.save:
+        out = Path(args.save)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        metrics = {
+            "scene": args.scene,
+            "n_runs": len(ratios),
+            "coverage_mean": round(float(np.mean(ratios)), 6),
+            "coverage_std": round(float(np.std(ratios)), 6),
+            "coverage_median": round(float(np.median(ratios)), 6),
+            "coverage_min": round(float(min(ratios)), 6),
+            "coverage_max": round(float(max(ratios)), 6),
+            "total_vol_m3": round(total_vol, 4),
+            "voxel_size_m": voxel_size,
+            "n_voxels": n_vox,
+            "runs": runs,
+        }
+        out.write_text(json.dumps(metrics, indent=2))
+        print(f"Metrics saved to {out}")
 
 
 if __name__ == "__main__":

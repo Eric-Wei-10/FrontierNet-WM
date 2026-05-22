@@ -12,12 +12,9 @@ input_img_size: [320, 320]
 focal_length: 300.0
 
 # ------ Frontier Manager ------
-filter_not_in_freespace: true               # remove frontiers not in the free voxel map; safe only in voxel_grid mode
-freespace_filter_dist: 3.0                  # allow DETR frontiers up to 3 m from nearest free voxel
-nav_path_filter_radius: 0.1                 # remove frontiers within this radius (m) of any navigation waypoint
 filter_max_vd_z: 0.65                       # max |vd_z| of viewing direction unit vector
 force_all_frontier_to_xy: False
-filter_min_gain: 1                          # minimum gain (m^3) to keep a frontier
+filter_min_gain: 10                         # GMM weights sum to ~1 over 20 slots (mean≈0.05); with gain_scale=100 this requires weight>0.10 — keeps only above-average slots
 
 visited_trans_threshold: 0.25              # translational threshold for "visited" check (classic unet frontiers)
 visited_angle_threshold: 0.4
@@ -29,7 +26,6 @@ detr_max_n_close: 5                        # retire frontier after this many clo
 
 max_active_frontiers: 20                   # hard cap; lowest-utility retired first
 graveyard_radius: 0.8                      # planning-failure / stuck exclusion radius (m)
-detection_graveyard_radius: 0.3            # observation-pose exclusion radius (m)
 
 utility_gain_factor: 1.0
 utility_dist_exponent: 1.5                 # distance penalty exponent (1.0=linear, >1=prefer nearby)
@@ -57,4 +53,4 @@ path_visit_penalty_weight: 1.0             # only active when planning_algo: rrt
 
 # ------ Exploration App ------
 predict_interval: 6
-plan_interval: 15
+detect_interval: 5

@@ -1,4 +1,4 @@
-_base: ../../base_mapex_exploration.yaml
+_base: ../mapex_base.yaml
 initial_cam_extrinsic:
   - [-0.90975949, -0.41502596, -0.00954587,  0.34127256]
   - [ 0.01181538, -0.00290099, -0.99992599,  1.3569866 ]

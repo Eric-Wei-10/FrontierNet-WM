@@ -25,7 +25,7 @@
 SCENE=${1:?"Usage: $0 <scene> <pt>"}
 PT=${2:?"Usage: $0 <scene> <pt>"}
 
-ROOT=/cluster/project/cvg/students/shangwu/FrontierNet
+ROOT=/cluster/project/cvg/students/shangwu/FrontierNet_mapex
 MAPEX_DIR=/cluster/project/cvg/students/shangwu/MapEx
 MAPEX_ENV=/cluster/project/cvg/students/shangwu/mapex_env
 
@@ -82,7 +82,7 @@ python -u demo_exploration_headless.py \
     --config      "${CONFIG}" \
     --mapex_map_size          512 \
     --mapex_map_margin        3.0 \
-    --mapex_min_frontier_size 10 \
+    --mapex_min_frontier_size 3 \
     --mapex_gain_scale        10000 \
     --log_level   10 \
     > "${EXPLORE_LOG}" 2>&1

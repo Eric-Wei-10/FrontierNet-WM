@@ -1,4 +1,4 @@
-_base: ../../base_mapex_exploration.yaml
+_base: ../mapex_base.yaml
 proximity_retirement_radius: 0.5
 utility_dist_exponent: 2
 initial_cam_extrinsic:
