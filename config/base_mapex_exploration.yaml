@@ -28,6 +28,11 @@ detr_visited_gain_reduction_factor: 0.7    # 0.2 was too aggressive: nearby fron
 detr_visited_dist_threshold: 1.0           # 1.5 was too large: start pose penalised frontiers 1.5 m away
 detr_max_n_close: 5
 
+filter_not_in_freespace: true            # reject MapEx frontiers not in the navigable PLY free space
+freespace_filter_dist: 0.5              # max distance (m) to nearest free voxel; tight to catch wall/exterior positions
+nav_path_filter_radius: 0.1
+detection_graveyard_radius: 0.3
+
 max_active_frontiers: 20
 graveyard_radius: 0.8
 

@@ -1,0 +1,49 @@
+# ============================================================
+# Universal base config for UNet-based FrontierNet baseline exploration.
+# Scene-specific configs inherit from this via:
+#   _base: ../../base_baseline_exploration.yaml
+# ============================================================
+
+# ------ FrontierNet UNet Model ------
+df_normalizer: 10
+df_thr: 0.3
+num_classes: 11
+input_img_size: [320, 320]
+focal_length: 300.0
+
+# ------ Frontier Manager ------
+filter_max_vd_z: 0.65
+force_all_frontier_to_xy: False
+filter_min_gain: 1
+
+visited_trans_threshold: 0.5
+visited_angle_threshold: 0.4
+visited_gain_reduction_factor: 2000
+utility_gain_factor: 1.0
+
+render_K: [60.0, 0.0, 64.0, 0.0, 60.0, 64.0, 0.0, 0.0, 1.0]
+render_H: 128
+render_W: 128
+render_d_range: 3.5
+render_decrease_factor: 1.0
+
+# ------ Mapping ------
+voxel_size: 0.1
+depth_range: 3.5
+
+# ------ Planning ------
+use_free_grid: True
+use_occ_grid: True
+min_dist2occ: 0.2
+max_dist2free: 0.15
+max_planning_time: 0.5
+planning_algo: rrtconnect
+
+# ------ Frontier visited decay (mapex-calibrated, see gain_adjustment_detr) ------
+detr_visited_gain_reduction_factor: 0.7   # 0.2 (detr) too aggressive; 0.7 from mapex tuning
+detr_visited_dist_threshold: 1.0          # metres — pos3d proximity radius (no angle check)
+detr_max_n_close: 5                       # hard-retire frontier after 5 nearby visits
+
+# ------ Exploration App ------
+predict_interval: 6
+plan_interval: 15

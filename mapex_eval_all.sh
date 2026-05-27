@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=mapex_eval_all
+#SBATCH --job-name=mapex_807
 #SBATCH --output=logs/mapex_eval_all_%j.out
 #SBATCH --error=logs/mapex_eval_all_%j.err
 #SBATCH --mem-per-cpu=32g
@@ -11,16 +11,34 @@
 # Full MapEx evaluation across all 10 scenes, all poses, N_RUNS times each.
 # Reports per-scene average coverage via eval/summarize.py.
 #
-# Usage (interactive):  bash mapex_eval_all.sh [<n_runs>]
-# Usage (sbatch):       sbatch mapex_eval_all.sh [<n_runs>]
+# Usage (interactive):  bash mapex_eval_all.sh [<n_runs>] [--metrics_only | --replay_only | --resume]
+# Usage (sbatch):       sbatch mapex_eval_all.sh [<n_runs>] [--metrics_only | --replay_only | --resume]
 #
-# <n_runs>  repetitions per (scene, pose); default 5
-#           RRTConnect path planning is stochastic, so multiple runs are needed.
+# <n_runs>        repetitions per (scene, pose); default 5
+#                 RRTConnect path planning is stochastic, so multiple runs are needed.
+# --metrics_only  skip exploration and replay; just run summarize.py on existing output files.
+# --replay_only   skip exploration; run replay only for runs that have exploration_state.json
+#                 but no exploration_state_with_volume.json.
+# --resume        skip runs that already have exploration_state_with_volume.json (fully done);
+#                 for runs with only exploration_state.json run replay only;
+#                 for runs with neither run the full explore+replay pipeline.
 #
 # Visualisation is disabled (no frames, no video).
 # Volume replay matches detr_eval_all.sh (no --voxel_grid, bounds-filtered wavemap).
 
+METRICS_ONLY=0
+REPLAY_ONLY=0
+RESUME=0
+SHARD=-1
+N_SHARDS=1
 N_RUNS=${1:-5}
+for arg in "$@"; do
+    [[ "${arg}" == "--metrics_only"  ]] && METRICS_ONLY=1
+    [[ "${arg}" == "--replay_only"   ]] && REPLAY_ONLY=1
+    [[ "${arg}" == "--resume"        ]] && RESUME=1
+    [[ "${arg}" == "--shard="*       ]] && SHARD="${arg#--shard=}"
+    [[ "${arg}" == "--n_shards="*    ]] && N_SHARDS="${arg#--n_shards=}"
+done
 
 ROOT=/cluster/project/cvg/students/shangwu/FrontierNet_mapex
 MAPEX_DIR=/cluster/project/cvg/students/shangwu/MapEx
@@ -30,8 +48,24 @@ MAPEX_ENV=/cluster/project/cvg/students/shangwu/mapex_env
 declare -A N_POSES
 N_POSES[804]=3; N_POSES[807]=4; N_POSES[812]=2; N_POSES[824]=3; N_POSES[827]=3
 N_POSES[834]=3; N_POSES[854]=1; N_POSES[876]=5; N_POSES[879]=4; N_POSES[880]=2
-# SCENES=(804 807 812 824 827 834 854 876 879 880)
-SCENES=876
+SCENES=(876 804 807 812 824 827 834 854 879 880)
+
+# Explicit shard assignments — balanced by total pose count (3 shards):
+#   shard 0: 876 812 834      →  5+2+3 = 10 poses
+#   shard 1: 807 824 854 880  →  4+3+1+2 =  10 poses
+#   shard 2: 804 827 879      →  3+3+4 = 10 poses
+declare -A _SCENE_SHARD
+_SCENE_SHARD[876]=0; _SCENE_SHARD[812]=0; _SCENE_SHARD[834]=0
+_SCENE_SHARD[804]=2; _SCENE_SHARD[824]=1; _SCENE_SHARD[854]=1; _SCENE_SHARD[880]=1
+_SCENE_SHARD[807]=1; _SCENE_SHARD[827]=2; _SCENE_SHARD[879]=2
+
+if [[ ${SHARD} -ge 0 ]]; then
+    SHARDED=()
+    for s in "${SCENES[@]}"; do
+        [[ "${_SCENE_SHARD[$s]}" -eq ${SHARD} ]] && SHARDED+=("$s")
+    done
+    SCENES=("${SHARDED[@]}")
+fi
 
 # ---- validate ----
 if [[ ! -d "${MAPEX_DIR}/pretrained_models/weights/big_lama" ]]; then
@@ -57,8 +91,10 @@ mkdir -p logs output
 TOTAL_RUNS=0
 for s in "${SCENES[@]}"; do TOTAL_RUNS=$(( TOTAL_RUNS + N_POSES[$s] * N_RUNS )); done
 
+SHARD_TAG=""
+[[ ${SHARD} -ge 0 ]] && SHARD_TAG="  shard=${SHARD}/${N_SHARDS}"
 echo "================================================================"
-echo " mapex_eval_all:  n_runs=${N_RUNS}  (RRT stochastic → multiple runs needed)"
+echo " mapex_eval_all:  n_runs=${N_RUNS}  (RRT stochastic → multiple runs needed)${SHARD_TAG}"
 echo " Scenes: ${SCENES[*]}"
 echo " Total runs: ${TOTAL_RUNS}"
 echo " Started: $(date)"
@@ -93,6 +129,44 @@ for SCENE in "${SCENES[@]}"; do
 
             echo "[$(date '+%H:%M:%S')] (${RUN_IDX}/${TOTAL_RUNS}) scene=${SCENE} pt=${PT} run=${RUN}"
 
+            if [[ $METRICS_ONLY -eq 1 ]]; then
+                VOLUME_JSON=output/${NAME}/exploration_state_with_volume.json
+                if [[ ! -f "${VOLUME_JSON}" ]]; then
+                    echo "  SKIP: no volume JSON found at ${VOLUME_JSON}"
+                fi
+                continue
+            fi
+
+            if [[ $REPLAY_ONLY -eq 1 ]]; then
+                OUTPUT_JSON=output/${NAME}/exploration_state.json
+                VOLUME_JSON=output/${NAME}/exploration_state_with_volume.json
+                if [[ ! -f "${OUTPUT_JSON}" ]]; then
+                    echo "  SKIP: no exploration JSON at ${OUTPUT_JSON}"
+                    continue
+                fi
+                if [[ -f "${VOLUME_JSON}" ]]; then
+                    echo "  SKIP: volume JSON already exists — ${VOLUME_JSON}"
+                    continue
+                fi
+                echo "  Replaying ${NAME} ..."
+                # fall through to the replay block below
+            elif [[ $RESUME -eq 1 ]]; then
+                OUTPUT_JSON=output/${NAME}/exploration_state.json
+                VOLUME_JSON=output/${NAME}/exploration_state_with_volume.json
+                if [[ -f "${VOLUME_JSON}" ]]; then
+                    echo "  SKIP: already complete — ${VOLUME_JSON}"
+                    continue
+                fi
+                if [[ -f "${OUTPUT_JSON}" ]]; then
+                    echo "  Resume: exploration exists, running replay only for ${NAME} ..."
+                    # fall through to replay block, skip explore
+                else
+                    echo "  Resume: running full explore+replay for ${NAME} ..."
+                    # fall through to explore block below
+                fi
+            fi
+
+            if [[ $REPLAY_ONLY -eq 0 && ! ( $RESUME -eq 1 && -f "output/${NAME}/exploration_state.json" ) ]]; then
             # ---- explore ----
             python -u demo_exploration_headless.py \
                 --write_path  output/${NAME}/exploration_state.json \
@@ -121,6 +195,7 @@ for SCENE in "${SCENES[@]}"; do
                     continue
                 fi
             fi
+            fi  # end of [[ $REPLAY_ONLY -eq 0 ]] else block
 
             # ---- compute volume (no video, no frames) ----
             python -u eval/replay_visualization_headless.py \
@@ -131,8 +206,24 @@ for SCENE in "${SCENES[@]}"; do
                 --volume_output output/${NAME}/exploration_state_with_volume.json \
                 > "${REPLAY_LOG}" 2>&1
 
-            if [[ $? -ne 0 ]]; then
-                echo "  ERROR: volume replay failed — see ${REPLAY_LOG}"
+            REPLAY_EC=$?
+            VOLUME_JSON=output/${NAME}/exploration_state_with_volume.json
+            VOLUME_SIZE=$(stat -c%s "${VOLUME_JSON}" 2>/dev/null || echo 0)
+            if [[ $REPLAY_EC -ne 0 ]]; then
+                if [[ $REPLAY_EC -eq 134 && $VOLUME_SIZE -gt 100000 ]]; then
+                    # SIGABRT at cleanup (same glibc heap issue as exploration).
+                    # Volume JSON was written before the crash — check it's complete.
+                    LAST_LINE=$(tail -c 2 "${VOLUME_JSON}" 2>/dev/null || echo "")
+                    if [[ "${LAST_LINE}" == *"}"* ]]; then
+                        echo "  WARN: replay exit ${REPLAY_EC} (heap corruption at cleanup, volume ${VOLUME_SIZE} bytes — proceeding)"
+                    else
+                        echo "  ERROR: replay exit ${REPLAY_EC} — volume JSON truncated (${VOLUME_SIZE} bytes) — see ${REPLAY_LOG}"
+                        continue
+                    fi
+                else
+                    echo "  ERROR: volume replay failed (exit ${REPLAY_EC}, volume ${VOLUME_SIZE} bytes) — see ${REPLAY_LOG}"
+                    continue
+                fi
             fi
         done
     done

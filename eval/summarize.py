@@ -13,6 +13,7 @@ Usage:
         --scene 876
 """
 import argparse
+import glob as _glob
 import json
 import sys
 from pathlib import Path
@@ -29,11 +30,25 @@ def load_total_volume(ply_path: str) -> Tuple[float, float, int]:
     return voxel_size**3 * n_vox, voxel_size, n_vox
 
 
-def final_mapped_vol(json_path: Path) -> float:
-    entries = [json.loads(l) for l in json_path.read_text().splitlines() if l.strip()]
+def load_entries(json_path: Path):
+    try:
+        return [json.loads(l) for l in json_path.read_text().splitlines() if l.strip()]
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"  WARNING: skipping {json_path} (corrupt JSON: {e})", file=sys.stderr)
+        return None
+
+
+def vol_at_fraction(entries: list, frac: float) -> float:
+    """mapped_vol at frac of the way through the entries (0.0 = start, 1.0 = end)."""
     if not entries:
         return 0.0
-    return float(entries[-1].get("mapped_vol") or 0.0)
+    idx = int(frac * (len(entries) - 1))
+    # Walk backward in case this exact entry lacks mapped_vol
+    for i in range(idx, -1, -1):
+        v = entries[i].get("mapped_vol")
+        if v is not None:
+            return float(v)
+    return 0.0
 
 
 def main():
@@ -46,49 +61,107 @@ def main():
                     help="Print per-run breakdown")
     ap.add_argument("--save", default=None,
                     help="Write metrics JSON to this path (parent dirs created automatically)")
+    ap.add_argument("--success_threshold", type=float, default=0.4,
+                    help="Coverage threshold for a run to count as successful (default: 0.4)")
     args = ap.parse_args()
 
-    files = sorted(Path(".").glob(args.json_glob))
+    files = sorted(Path(p) for p in _glob.glob(args.json_glob))
     if not files:
         print(f"No files matched: {args.json_glob}", file=sys.stderr)
         sys.exit(1)
 
     total_vol, voxel_size, n_vox = load_total_volume(args.voxel_grid)
     ratios: List[float] = []
+    ratios25: List[float] = []
+    ratios50: List[float] = []
     runs: List[dict] = []
 
     for f in files:
-        vol = final_mapped_vol(f)
-        ratio = vol / total_vol if total_vol > 0 else 0.0
+        entries = load_entries(f)
+        if entries is None:
+            continue
+        vol = float(entries[-1].get("mapped_vol") or 0.0)
+        v25 = vol_at_fraction(entries, 0.25)
+        v50 = vol_at_fraction(entries, 0.50)
+        ratio    = vol / total_vol if total_vol > 0 else 0.0
+        ratio25  = v25 / total_vol if total_vol > 0 else 0.0
+        ratio50  = v50 / total_vol if total_vol > 0 else 0.0
+        success  = ratio >= args.success_threshold
         ratios.append(ratio)
-        runs.append({"name": f.parent.name, "coverage": round(ratio, 6), "mapped_vol_m3": round(vol, 4)})
+        ratios25.append(ratio25)
+        ratios50.append(ratio50)
+        runs.append({
+            "name": f.parent.name,
+            "coverage": round(ratio, 6),
+            "coverage@25": round(ratio25, 6),
+            "coverage@50": round(ratio50, 6),
+            "mapped_vol_m3": round(vol, 4),
+            "success": success,
+        })
         if args.verbose:
-            print(f"  {f.parent.name}: {ratio:.2%}  ({vol:.3f} / {total_vol:.3f} m³)")
+            tag = "OK" if success else "FAIL"
+            print(f"  [{tag}] {f.parent.name}: {ratio:.2%}  "
+                  f"(@25%={ratio25:.2%}  @50%={ratio50:.2%}  "
+                  f"vol={vol:.1f}/{total_vol:.1f} m³)")
 
     if not ratios:
         print("No valid runs found.")
         sys.exit(1)
 
+    thr = args.success_threshold
+    n_total = len(ratios)
+    succ_mask = [r >= thr for r in ratios]
+    successful   = [r   for r, s in zip(ratios,   succ_mask) if s]
+    successful25 = [r25 for r25, s in zip(ratios25, succ_mask) if s]
+    successful50 = [r50 for r50, s in zip(ratios50, succ_mask) if s]
+    n_success = len(successful)
+    success_rate = n_success / n_total
+
+    def _stats(vals):
+        if not vals:
+            return None, None, None, None, None
+        return (round(float(np.mean(vals)),   6),
+                round(float(np.std(vals)),    6),
+                round(float(np.median(vals)), 6),
+                round(float(min(vals)),       6),
+                round(float(max(vals)),       6))
+
     label = f"Scene {args.scene}" if args.scene else "Summary"
-    print(f"\n{'='*52}")
-    print(f" {label}  |  n={len(ratios)}  |  voxel_size={voxel_size:.3f}m  |  total={total_vol:.2f}m³")
-    print(f"{'='*52}")
-    print(f"  Final coverage : {np.mean(ratios):.2%} ± {np.std(ratios):.2%}")
-    print(f"  Min / Max      : {min(ratios):.2%} / {max(ratios):.2%}")
-    print(f"  Median         : {np.median(ratios):.2%}")
-    print(f"{'='*52}\n")
+    print(f"\n{'='*60}")
+    print(f" {label}  |  n={n_total}  |  voxel_size={voxel_size:.3f}m  |  total={total_vol:.2f}m³")
+    print(f"{'='*60}")
+    print(f"  Success rate   : {success_rate:.2%}  ({n_success}/{n_total}, threshold={thr:.0%})")
+    if successful:
+        print(f"  vox@25 : {np.mean(successful25):.2%} ± {np.std(successful25):.2%}")
+        print(f"  vox@50 : {np.mean(successful50):.2%} ± {np.std(successful50):.2%}")
+        print(f"  vox@100 : {np.mean(successful):.2%} ± {np.std(successful):.2%}")
+        print(f"  Min / Max      : {min(successful):.2%} / {max(successful):.2%}")
+        print(f"  Median         : {np.median(successful):.2%}")
+    else:
+        print(f"  Coverage (succ): N/A  (no successful runs)")
+    print(f"{'='*60}\n")
 
     if args.save:
+        mean, std, med, mn, mx = _stats(successful)
+        m25, s25, *_ = _stats(successful25)
+        m50, s50, *_ = _stats(successful50)
         out = Path(args.save)
         out.parent.mkdir(parents=True, exist_ok=True)
         metrics = {
             "scene": args.scene,
-            "n_runs": len(ratios),
-            "coverage_mean": round(float(np.mean(ratios)), 6),
-            "coverage_std": round(float(np.std(ratios)), 6),
-            "coverage_median": round(float(np.median(ratios)), 6),
-            "coverage_min": round(float(min(ratios)), 6),
-            "coverage_max": round(float(max(ratios)), 6),
+            "n_runs": n_total,
+            "success_threshold": thr,
+            "success_rate": round(success_rate, 6),
+            "n_success": n_success,
+            "coverage_mean": mean,
+            "coverage_std": std,
+            "coverage_median": med,
+            "coverage_min": mn,
+            "coverage_max": mx,
+            "vox25_mean": m25,
+            "vox25_std": s25,
+            "vox50_mean": m50,
+            "vox50_std": s50,
             "total_vol_m3": round(total_vol, 4),
             "voxel_size_m": voxel_size,
             "n_voxels": n_vox,

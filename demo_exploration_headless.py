@@ -282,10 +282,22 @@ class HeadlessExplorerApp:
         self._frozen_iters: int = 0          # consecutive iterations with same n_robot_poses
         self._last_n_robot_poses: int = -1   # n_robot_poses value at previous iteration
 
+        # Fix 1: track the last n_robot_poses value at which detection was run.
+        # The trigger (n_robot_poses % detect_interval == 0) stays True for every
+        # frozen iteration, so without this guard DETR fires repeatedly from the
+        # same viewpoint whenever path waypoints are too close to advance the counter.
+        self._last_detect_step: int = -1
+
         # Fix 3: dirty flag for gain recomputation.
         # gain_adjustment_detr is O(N*M) in frontiers × robot poses; skip it when
         # neither the pose set nor the frontier set has changed.
         self._last_gain_adj_n_poses: int = -1
+
+        # Fallback navigation: when all frontiers are exhausted, navigate toward
+        # the most-unexplored part of the free-space grid.  Limited to avoid
+        # infinite loops when the entire reachable space is already covered.
+        self._fallback_count: int = 0
+        self._fallback_max: int = 20
 
         # JSON output
         save_dir = os.path.join(os.path.dirname(__file__), "output")
@@ -437,6 +449,99 @@ class HeadlessExplorerApp:
         logging.info("Saved DETR debug image: %s", out_path)
         self._debug_step += 1
 
+    # ---------- fallback navigation ----------
+
+    def _find_fallback_goal(self, current_pose: np.ndarray) -> Optional[List[np.ndarray]]:
+        """
+        When all frontiers are exhausted, navigate toward the most-unexplored
+        part of the free-space grid — the free voxel farthest from all previously
+        visited robot positions.
+
+        Returns a path (list of 4×4 poses) or None if no viable goal exists.
+        """
+        from scipy.spatial import KDTree as _ScipyKDTree
+        from utils.geometry import compute_alignment_transforms
+
+        planner = self.ft_manager.planner
+        if planner._free_kdt is None or planner._free_kdt.n == 0:
+            logging.info("Fallback: no free KDTree available.")
+            return None
+
+        free_pts = np.asarray(planner._free_kdt.data, dtype=float)  # (N, 3)
+
+        if not self.ft_manager.robot_poses:
+            return None
+        robot_pos_arr = np.array(
+            [p[:3, 3] for p in self.ft_manager.robot_poses.values()], dtype=float
+        )
+
+        # Distance of each free voxel to the nearest visited robot pose
+        robot_kdt = _ScipyKDTree(robot_pos_arr)
+        dists_to_visited, _ = robot_kdt.query(free_pts, k=1)
+
+        # Select candidates that are far from all visited positions
+        for threshold in (1.5, 1.0, 0.6):
+            mask = dists_to_visited > threshold
+            if mask.any():
+                break
+        else:
+            logging.info("Fallback: all free voxels are within 0.6 m of visited poses.")
+            return None
+
+        candidate_pts = free_pts[mask]
+        candidate_dists = dists_to_visited[mask]
+
+        # Sort candidates by distance to visited poses (farthest = most unexplored first)
+        sorted_idxs = np.argsort(candidate_dists)[::-1]
+
+        cur_pos = current_pose[:3, 3].copy()
+
+        # Try up to 20 candidates in order of decreasing unexploredness
+        max_tries = min(20, len(sorted_idxs))
+        for rank, idx in enumerate(sorted_idxs[:max_tries]):
+            goal_pos = candidate_pts[idx].copy()
+
+            direction = goal_pos - cur_pos
+            norm = float(np.linalg.norm(direction))
+            direction = direction / norm if norm > 1e-8 else np.array([1.0, 0.0, 0.0])
+
+            goal_pose = compute_alignment_transforms(
+                origins=[goal_pos],
+                align_vec=direction,
+                align_axis=[0, 0, 1],
+                appr_vec=[0, 0, -1],
+                appr_axis=[0, 1, 0],
+            )[0]
+            goal_pose[:3, 3] = goal_pos
+
+            planner.update_start_goal(start=current_pose, goal=goal_pose)
+            try:
+                found = planner.solve(
+                    time_limit=self.ft_manager.max_planning_time,
+                    method=self.ft_manager.planning_algo,
+                )
+                if not found:
+                    logging.debug(
+                        "Fallback candidate %d/(%.2f,%.2f,%.2f) failed — trying next.",
+                        rank, *goal_pos,
+                    )
+                    continue
+                planner.interpolate_path()
+                path = planner.get_solution_path(return_type="mat")
+                logging.info(
+                    "Fallback %d/%d: navigating to (%.2f, %.2f, %.2f) "
+                    "(candidate rank %d), dist=%.2f m, path_len=%d steps.",
+                    self._fallback_count + 1, self._fallback_max,
+                    *goal_pos, rank, float(candidate_dists[idx]), len(path),
+                )
+                return path
+            except Exception as e:
+                logging.debug("Fallback candidate %d raised exception: %s — trying next.", rank, e)
+                continue
+
+        logging.info("Fallback: all %d candidates failed path planning.", max_tries)
+        return None
+
     # ---------- main exploration logic ----------
 
     def exploration(self) -> None:
@@ -531,9 +636,15 @@ class HeadlessExplorerApp:
                 self._frozen_iters > 0
                 and self._frozen_iters % _FROZEN_DETECT_EVERY == 0
             )
-            should_detect = no_more_frontier or (
+            # Fix 1: guard against re-detecting at the same n_robot_poses value.
+            # The modulo trigger stays True for every frozen iteration where the
+            # step counter is divisible by detect_interval; without the guard DETR
+            # would run multiple times from an essentially identical viewpoint.
+            _interval_trigger = (
                 n_robot_poses % self.detect_interval == 0
-            ) or frozen_force_detect
+                and n_robot_poses != self._last_detect_step
+            )
+            should_detect = no_more_frontier or _interval_trigger or frozen_force_detect
 
             # Replan only when there is no active path, or the current goal
             # frontier has disappeared (filtered / graveyard). Detection alone
@@ -561,6 +672,7 @@ class HeadlessExplorerApp:
 
             ft_list = None  # Fix 3: initialise so it's visible outside the detect block
             if should_detect:
+                self._last_detect_step = n_robot_poses  # Fix 1: suppress re-trigger at same step
                 logging.info("Running frontier detection (step %d).", n_robot_poses)
                 rgb, depth = self.get_rgbd()
 
@@ -624,11 +736,34 @@ class HeadlessExplorerApp:
                     else:
                         parent_ids = self.ft_manager.add_robot_poses([W_T_C])
                     self.ft_manager.add_frontiers(frontiers=ft_list, parent_ids=parent_ids)
-                    self.ft_manager.filter_frontiers()
+                    # Fix 2: do NOT filter here — gains have not been computed yet,
+                    # so n_close-based retirements would be premature.  The
+                    # post-gain_adjustment filter (below) handles all retirement.
 
                 if len(self.ft_manager.valid_frontiers) == 0:
-                    logging.info("No frontiers, exploration finished.")
-                    break
+                    # Only attempt fallback when there is no active path so the
+                    # robot has already consumed any previously-set fallback route.
+                    if not self.path_to_go:
+                        if self._fallback_count < self._fallback_max:
+                            fallback = self._find_fallback_goal(W_T_C)
+                            if fallback:
+                                self.path_to_go = fallback
+                                self._fallback_count += 1
+                                logging.info(
+                                    "No frontiers — fallback %d/%d set (%d steps).",
+                                    self._fallback_count, self._fallback_max,
+                                    len(self.path_to_go),
+                                )
+                            else:
+                                logging.info("No frontiers and no reachable unexplored area — finished.")
+                                break
+                        else:
+                            logging.info(
+                                "No frontiers and fallback limit (%d) reached — finished.",
+                                self._fallback_max,
+                            )
+                            break
+                    # If path_to_go is non-empty (active fallback in progress), keep going.
 
             # Update mapper continuously.
             # When --voxel_grid is set the planner uses the pre-loaded global map
@@ -640,14 +775,15 @@ class HeadlessExplorerApp:
                 og = self.mapper.get_occupancy_grid()
                 self.ft_manager.update_map(free_map=og["free"], occ_map=og["occupied"])
 
-            # Fix 3: gain_adjustment is O(N*M) in frontiers × robot poses.  Only
-            # rerun it when the inputs have actually changed: new robot poses were
-            # added (step counter advanced) or new frontiers were just detected.
-            # update_utility always runs because it depends on the current robot
-            # position, which can change even without new poses being recorded.
+            # Fix 3 + Fix 5: gain_adjustment is O(N*M) in frontiers × robot poses.
+            # Run immediately when new frontiers are detected (ft_list is truthy)
+            # so they get valid u_gains before the first filter/utility call.
+            # Otherwise throttle to every 5 robot steps: n_close values change only
+            # when the robot crosses within detr_visited_dist_threshold of a frontier,
+            # so running every step (0.1 m) adds no new information in practice.
             _gain_inputs_changed = (
-                n_robot_poses > self._last_gain_adj_n_poses
-                or bool(ft_list)
+                bool(ft_list)
+                or n_robot_poses - self._last_gain_adj_n_poses >= 5
             )
             if _gain_inputs_changed:
                 if self.args.model_type in {"detr", "cond_detr", "mapex"}:
@@ -660,33 +796,59 @@ class HeadlessExplorerApp:
                 self._last_gain_adj_n_poses = n_robot_poses
             self.ft_manager.update_utility(current_pos=W_T_C[:3, 3])
 
-            # Replan if needed
+            # Replan if needed — but only when there are actual frontier goals to plan toward.
+            # If valid_frontiers is empty we might be on a fallback path; don't
+            # overwrite it with an empty plan.
             if should_replan and (self.move_enough or not self.path_to_go):
-                logging.info("Replanning...")
-                logging.debug(f"Replanning (interval={self.plan_interval}).")
-                self.path_to_go = self.ft_manager.plan_path_to_goal(
-                    W_T_C,
-                    direct_voxel_snap=bool(self.args.voxel_grid),
-                ) or []
-                if self.path_to_go:
-                    logging.info(
-                        f"Path to goal found with {len(self.path_to_go)} steps."
-                    )
-                    self.move_enough = False
-                else:
-                    logging.warning("No path found, deleting current goal frontier.")
-                    self._recent_positions.clear()
-                    self.path_to_go = []
-                    self.move_enough = True  # try again next cycle
+                if self.ft_manager.valid_frontiers:
+                    logging.info("Replanning...")
+                    logging.debug(f"Replanning (interval={self.plan_interval}).")
+                    new_path = self.ft_manager.plan_path_to_goal(
+                        W_T_C,
+                        direct_voxel_snap=bool(self.args.voxel_grid),
+                    ) or []
+                    if new_path:
+                        self.path_to_go = new_path
+                        self._recent_positions.clear()
+                        logging.info(
+                            f"Path to goal found with {len(self.path_to_go)} steps."
+                        )
+                        self.move_enough = False
+                    else:
+                        logging.warning("No path found, deleting current goal frontier.")
+                        self._recent_positions.clear()
+                        if not self.path_to_go:
+                            self.path_to_go = []
+                        self.move_enough = True  # try again next cycle
+                elif not self.path_to_go:
+                    # No frontiers and no active path: will be handled by the
+                    # safety termination or next detection cycle.
+                    self.move_enough = True
 
             # Safety termination: if there is nothing to navigate toward and no
             # frontiers remain (e.g. all dropped by filter or stuck-detection),
-            # stop rather than spinning until max_time_s.
+            # try fallback before stopping.
             if not self.path_to_go and len(self.ft_manager.valid_frontiers) == 0:
-                logging.info(
-                    "No valid frontiers and no active path — exploration finished."
-                )
-                break
+                if self._fallback_count < self._fallback_max:
+                    fallback = self._find_fallback_goal(W_T_C)
+                    if fallback:
+                        self.path_to_go = fallback
+                        self._fallback_count += 1
+                        logging.info(
+                            "Safety fallback %d/%d set (%d steps).",
+                            self._fallback_count, self._fallback_max,
+                            len(self.path_to_go),
+                        )
+                    else:
+                        logging.info(
+                            "No valid frontiers and no active path — exploration finished."
+                        )
+                        break
+                else:
+                    logging.info(
+                        "No valid frontiers, no active path, fallback limit reached — finished."
+                    )
+                    break
 
             # Persist state snapshot
             if self.json_path:
@@ -1102,7 +1264,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max_steps",
         type=int,
-        default=1000,
+        default=1000,  # shell script passes this explicitly; kept in sync
         help="Maximum number of exploration steps",
     )
     p.add_argument(

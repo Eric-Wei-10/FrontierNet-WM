@@ -25,7 +25,11 @@ detr_visited_dist_threshold: 1.0           # robot pose within this distance (m)
 detr_max_n_close: 5                        # retire frontier after this many close robot poses
 
 max_active_frontiers: 20                   # hard cap; lowest-utility retired first
-graveyard_radius: 0.8                      # planning-failure / stuck exclusion radius (m)
+graveyard_radius: 0.8
+
+filter_not_in_freespace: true              # remove frontiers in walls / exterior (not near any free voxel)
+freespace_filter_dist: 1.5                 # DETR frontiers land at occluded surfaces; use 1.5 m so valid
+                                           # boundary frontiers pass while wall/exterior ones are rejected
 
 utility_gain_factor: 1.0
 utility_dist_exponent: 1.5                 # distance penalty exponent (1.0=linear, >1=prefer nearby)

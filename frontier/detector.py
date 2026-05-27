@@ -104,8 +104,16 @@ class FrontierDetector(Base):
             np.array2string(z_np, precision=3, suppress_small=True),
         )
         self.logger.info(
-            "detect_detr conf_np: %s",
+            "detect_detr conf_np:   %s",
             np.array2string(conf_np, precision=3, suppress_small=True),
+        )
+        self.logger.info(
+            "detect_detr weight_np: %s",
+            np.array2string(weight_np, precision=3, suppress_small=True),
+        )
+        self.logger.info(
+            "detect_detr occ_np:    %s",
+            np.array2string(occ_np, precision=3, suppress_small=True),
         )
 
         model_H, model_W = self.img_size_model

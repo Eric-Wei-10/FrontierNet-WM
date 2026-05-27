@@ -133,6 +133,19 @@ class FrontierManager(Base):
         # first.  0 means unlimited.
         self.max_active_frontiers: int = int(p.get("max_active_frontiers", 0))
 
+        # Filter: remove frontiers not in the free-voxel map (outside walls /
+        # unreachable). Safe to enable only when the free map is pre-loaded and
+        # complete (voxel_grid mode). In incremental wavemap mode, unmapped rooms
+        # are also isfree=False, so enabling this would remove valid frontiers there.
+        self.filter_not_in_freespace: bool = bool(p.get("filter_not_in_freespace", False))
+        # Maximum distance (m) from the nearest free voxel for a frontier to pass
+        # the freespace filter.  0.0 means use planner.isfree() (strict, within
+        # max_dist2free=0.15 m).  For DETR mode, use ~1.5 m: DETR frontiers land
+        # at the depth of occluded surfaces which may be slightly beyond the free-
+        # space boundary, but wall/exterior frontiers are typically 2+ m from any
+        # navigable free voxel.
+        self.freespace_filter_dist: float = float(p.get("freespace_filter_dist", 0.0))
+
         # Maximum number of "close visit" counts (n_close) before a DETR frontier is
         # retired to the graveyard.  n_close is incremented by gain_adjustment_detr()
         # each time a stored robot pose is within detr_visited_dist_threshold of the
@@ -149,6 +162,22 @@ class FrontierManager(Base):
         # not persist in the active set.
         self.proximity_retirement_radius: float = float(
             p.get("proximity_retirement_radius", 0.0)
+        )
+
+        # Recent-trajectory penalty in update_utility(): frontiers whose pos3d falls
+        # within trajectory_penalty_radius of any of the last trajectory_penalty_window
+        # robot poses have their utility scaled by trajectory_penalty_factor.
+        # This discourages the robot from immediately turning back to areas it just
+        # traversed, reducing zigzag backtracking without disrupting long-range gain
+        # comparisons.  0.0 radius disables the penalty entirely.
+        self.trajectory_penalty_radius: float = float(
+            p.get("trajectory_penalty_radius", 0.0)
+        )
+        self.trajectory_penalty_factor: float = float(
+            p.get("trajectory_penalty_factor", 0.3)
+        )
+        self.trajectory_penalty_window: int = int(
+            p.get("trajectory_penalty_window", 20)
         )
 
 
@@ -874,6 +903,25 @@ class FrontierManager(Base):
 
             ft.utility = (base_gain ** float(self.utility_g_factor)) / denom
 
+        # Recent-trajectory penalty: scale down utility for frontiers whose pos3d
+        # lies within trajectory_penalty_radius of any of the last
+        # trajectory_penalty_window robot poses.  This discourages the planner from
+        # immediately reversing into a corridor the robot just traversed, reducing
+        # the zigzag backtracking pattern without changing the gain accounting.
+        if self.trajectory_penalty_radius > 0 and self.robot_poses:
+            sorted_rids = sorted(self.robot_poses.keys())
+            recent_rids = sorted_rids[-self.trajectory_penalty_window:]
+            recent_pts = np.array(
+                [self.robot_poses[rid][:3, 3] for rid in recent_rids], dtype=float
+            )
+            for ft in valid:
+                if ft.utility is None:
+                    continue
+                ft_pos = np.asarray(ft.pos3d, dtype=float)
+                d_path = float(np.linalg.norm(recent_pts - ft_pos, axis=1).min())
+                if d_path < self.trajectory_penalty_radius:
+                    ft.utility = float(ft.utility) * self.trajectory_penalty_factor
+
         if valid:
             sorted_fts = sorted(valid, key=lambda f: f.utility or 0.0, reverse=True)
             header = (
@@ -934,10 +982,12 @@ class FrontierManager(Base):
         n_bbox_removed = 0
         n_prox_removed = 0
         n_gain_removed = 0
+        n_ugain_removed = 0
         n_nclose_removed = 0
         n_vdz_removed = 0
         n_occ_removed = 0
         n_grave_removed = 0
+        n_freespace_removed = 0
 
         for fid, ft in list(self.frontiers.items()):
             if not ft.is_valid:
@@ -990,7 +1040,31 @@ class FrontierManager(Base):
                 self.logger.debug(f"Frontier {fid} invalid (gain<{min_gain}).")
                 continue
 
-            # 2b) n_close retirement: retire frontiers the robot has passed near enough
+            # 2b) u_gain retirement: retire frontiers whose visit-decayed effective
+            # gain has fallen to the 1e-4 clamp floor in gain_adjustment_detr().
+            # The raw-gain filter (above) only removes never-detected frontiers;
+            # this check removes frontiers that have been physically visited so many
+            # times that they carry no usable information signal, even though their
+            # raw gain is still above filter_min_gain.  We use 1e-3 as the threshold
+            # (10× the clamp floor) to retire slightly before the absolute floor so
+            # near-zero-utility frontiers never win goal selection.
+            ug = float(getattr(ft, "u_gain", None) or 0.0)
+            if ug <= 1e-3 and fid != self.current_goal_ft_id:
+                ft.set_invalid()
+                n_ugain_removed += 1
+                pos_arr = np.asarray(ft.pos3d, dtype=float).copy()
+                self._graveyard.append(pos_arr)
+                if graveyard_arr is None:
+                    graveyard_arr = pos_arr.reshape(1, 3)
+                else:
+                    graveyard_arr = np.vstack([graveyard_arr, pos_arr.reshape(1, 3)])
+                self.logger.debug(
+                    "Frontier %d retired (u_gain=%.2e <= 1e-3, n_close=%d).",
+                    fid, ug, getattr(ft, "n_close", 0),
+                )
+                continue
+
+            # 2c) n_close retirement: retire frontiers the robot has passed near enough
             # times to be considered definitively explored.  Separate from the gain
             # filter so a single doorway peek (n_close=1) never eliminates a frontier,
             # but thorough traversal (n_close >= detr_max_n_close) does.
@@ -1039,13 +1113,33 @@ class FrontierManager(Base):
                     )
                     continue
 
+            # 6) Not in free navigable space (outside walls / unreachable).
+            # Only meaningful when the free map is pre-loaded and complete (voxel_grid mode).
+            # Enable via filter_not_in_freespace=True in config.  When freespace_filter_dist > 0,
+            # the check is relaxed: reject only frontiers whose nearest free voxel is farther
+            # than that distance.  Use ~1.5 m for DETR mode where frontier positions land at
+            # the depth of occluded surfaces and may be slightly beyond the free-space boundary.
+            if self.filter_not_in_freespace and self.planner._free_kdt is not None:
+                if self.freespace_filter_dist > 0.0:
+                    dist_to_free, _ = self.planner._free_kdt.query(ft.pos3d)
+                    is_too_far = float(dist_to_free) > self.freespace_filter_dist
+                else:
+                    is_too_far = not self.planner.isfree(ft.pos3d)
+                if is_too_far:
+                    ft.set_invalid()
+                    n_freespace_removed += 1
+                    self.logger.debug("Frontier %d invalid (not in free space).", fid)
+                    continue
+
         n_after_prox = n_before - n_prox_removed
         n_after_bbox = n_after_prox - n_bbox_removed
         n_after_gain = n_after_bbox - n_gain_removed
-        n_after_nclose = n_after_gain - n_nclose_removed
+        n_after_ugain = n_after_gain - n_ugain_removed
+        n_after_nclose = n_after_ugain - n_nclose_removed
         n_after_vdz = n_after_nclose - n_vdz_removed
         n_after_occ = n_after_vdz - n_occ_removed
         n_after_grave = n_after_occ - n_grave_removed
+        n_after_freespace = n_after_grave - n_freespace_removed
 
         if n_prox_removed:
             self.logger.info(
@@ -1055,6 +1149,8 @@ class FrontierManager(Base):
         if bbox is not None:
             self.logger.info(f"[filter] After bbox:       {n_after_bbox} valid  (-{n_bbox_removed})")
         self.logger.info(f"[filter] After gain:       {n_after_gain} valid  (-{n_gain_removed}, threshold={min_gain})")
+        if n_ugain_removed:
+            self.logger.info(f"[filter] After u_gain:     {n_after_ugain} valid  (-{n_ugain_removed}, threshold=1e-3)")
         if self.detr_max_n_close > 0:
             self.logger.info(
                 f"[filter] After n_close:    {n_after_nclose} valid  "
@@ -1066,8 +1162,10 @@ class FrontierManager(Base):
             self.logger.info(f"[filter] After occ:        {n_after_occ} valid  (-{n_occ_removed})")
         if self._graveyard:
             self.logger.info(f"[filter] After graveyard:  {n_after_grave} valid  (-{n_grave_removed}, r={self.graveyard_radius:.2f}m)")
+        if self.filter_not_in_freespace:
+            self.logger.info(f"[filter] After freespace:  {n_after_freespace} valid  (-{n_freespace_removed})")
 
-        # 6) Hard cap: retire lowest-utility frontiers when count exceeds max_active_frontiers.
+        # 7) Hard cap: retire lowest-utility frontiers when count exceeds max_active_frontiers.
         # Record retired positions to the graveyard so they are not immediately re-detected.
         n_cap_removed = 0
         if self.max_active_frontiers > 0:
@@ -1087,7 +1185,7 @@ class FrontierManager(Base):
                     self.max_active_frontiers, n_cap_removed, self.max_active_frontiers,
                 )
 
-        n_final = n_after_grave - n_cap_removed
+        n_final = n_after_freespace - n_cap_removed
         self.logger.info(f"[filter] End:   {n_final} valid frontiers remain")
 
         # Purge all marked frontiers (graveyard entries were already written
@@ -1411,8 +1509,12 @@ class FrontierManager(Base):
             )
 
             if not path_found:
-                # If unreachable, drop this frontier as a goal candidate
-                self.remove_frontiers([goal_ft_id])
+                # Drop this frontier as a goal candidate but do NOT add it to the
+                # graveyard: path failure means the robot cannot reach it from its
+                # current position, not that the frontier itself is invalid.  Adding
+                # to the graveyard would block future detections of valid areas once
+                # the robot navigates to a different vantage point.
+                self.remove_frontiers([goal_ft_id], _record_graveyard=False)
                 self.current_goal_ft_id = None
                 self.current_goal_pose = None
                 return None
@@ -1424,8 +1526,7 @@ class FrontierManager(Base):
 
         except Exception as e:
             self.logger.error(f"Path planning failed: {e}")
-            # If planning fails, drop this frontier as a goal candidate
-            self.remove_frontiers([goal_ft_id])
+            self.remove_frontiers([goal_ft_id], _record_graveyard=False)
             self.current_goal_ft_id = None
             self.current_goal_pose = None
             self.logger.debug("Dropped goal frontier due to planning failure.")

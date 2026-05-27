@@ -82,6 +82,8 @@ python -u demo_exploration_headless.py \
     --config "${CONFIG}" \
     --detr_conf_thresh 0.15 \
     --detr_visible_gain_discount 0.45 \
+    --detr_dedup_radius 0.3 \
+    --max_steps 1000 \
     --log_level 10 \
     > "${EXPLORE_LOG}" 2>&1
 echo "Exploration log: ${EXPLORE_LOG}"
