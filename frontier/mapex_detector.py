@@ -46,7 +46,7 @@ class MapExFrontierDetector:
         map_size: int = 512,        # side length of the top-down map (px); must be multiple of 16
         map_margin_m: float = 3.0,  # extra metres of unknown border beyond observed extent
         min_frontier_size: int = 10,
-        gain_scale: float = 1e4,    # scale raw variance [0-0.083] → gain; floor is 2 × filter_min_gain
+        gain_scale: float = 360.0,  # scale raw variance [0-0.083] → gain in [2, 30]; matches baseline UNet range
         voxel_size: float = 0.1,    # wavemap voxel resolution (m); m_per_px is clamped to this minimum
         log_level: int = logging.INFO,
     ):

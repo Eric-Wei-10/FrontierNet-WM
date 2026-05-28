@@ -54,7 +54,6 @@ class FrontierDetector(Base):
         extrinsic: np.ndarray,
         conf_thresh: float = 0.3,
         gain_scale: float = 10.0,
-        visible_gain_discount: float = 0.1,
     ) -> Optional[List[Frontier]]:
         """
         Run DETR-style frontier detection.
@@ -160,8 +159,7 @@ class FrontierDetector(Base):
 
             direct_angle = float(np.arctan2(v_px - cy, u_px - cx))
 
-            base_gain = float(weight_np[n]) * gain_scale
-            effective_gain = base_gain if is_occluded else base_gain * visible_gain_discount
+            effective_gain = float(weight_np[n]) * gain_scale
 
             self.detr_slots.append({
                 "u_px": u_px, "v_px": v_px,
@@ -187,8 +185,7 @@ class FrontierDetector(Base):
         self.ft_3D = frontiers if frontiers else None
         self.logger.info(
             "DETR detect: %d frontiers total  "
-            "(%d occluded/priority, %d visible/discounted, conf_thresh=%.2f, "
-            "visible_gain_discount=%.2f)",
-            len(frontiers), n_occ, n_vis, conf_thresh, visible_gain_discount,
+            "(%d occluded, %d visible, conf_thresh=%.2f)",
+            len(frontiers), n_occ, n_vis, conf_thresh,
         )
         return frontiers if frontiers else None

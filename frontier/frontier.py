@@ -22,15 +22,6 @@ class Frontier:
             "6d_pose": None,  # placeholder for future 6D pose
         }
 
-        # Diagnostic field: number of close robot poses found during gain_adjustment_detr.
-        # Not persisted to JSON; reset to 0 on each gain_adjustment_detr call.
-        self.n_close: int = 0
-
-        # Nearest free-voxel goal set by FrontierManager._snap_goal_to_free_voxel()
-        # after path planning.  Used in gain_adjustment_detr to detect when the robot
-        # physically traversed the planned navigation waypoint for this frontier.
-        self.snapped_pos: Optional[np.ndarray] = None
-
         if frontier_feature is not None:
             arr = np.asarray(frontier_feature, dtype=float)
             if arr.shape != (10,):

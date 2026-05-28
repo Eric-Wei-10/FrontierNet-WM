@@ -27,7 +27,7 @@
 # Volume replay is kept (needed for coverage stats).
 
 CKPT=${1:?"Usage: $0 <ckpt_name> [n_runs] [--metrics_only|--replay_only|--resume] [--shard=N] [--n_shards=N]"}
-N_RUNS=${2:-5}
+[[ "${2:-}" == --* ]] && N_RUNS=5 || N_RUNS=${2:-5}
 METRICS_ONLY=0
 REPLAY_ONLY=0
 RESUME=0
@@ -50,14 +50,20 @@ N_POSES[804]=3; N_POSES[807]=4; N_POSES[812]=2; N_POSES[824]=3; N_POSES[827]=3
 N_POSES[834]=3; N_POSES[854]=1; N_POSES[876]=5; N_POSES[879]=4; N_POSES[880]=2
 SCENES=(876 804 807 812 824 827 834 854 879 880)
 
-# Explicit shard assignments — balanced by total pose count (3 shards):
-#   shard 0: 876 812 834      →  5+2+3 = 10 poses
-#   shard 1: 804 824 854 880  →  3+3+1+2 =  9 poses
-#   shard 2: 807 827 879      →  4+3+4 = 11 poses
+# Explicit shard assignments — balanced by total pose count (6 shards):
+#   shard 0: 876            →  5 poses
+#   shard 1: 807 854        →  4+1 = 5 poses
+#   shard 2: 879            →  4 poses
+#   shard 3: 804 812        →  3+2 = 5 poses
+#   shard 4: 824 880        →  3+2 = 5 poses
+#   shard 5: 827 834        →  3+3 = 6 poses
 declare -A _SCENE_SHARD
-_SCENE_SHARD[876]=0; _SCENE_SHARD[812]=0; _SCENE_SHARD[834]=0
-_SCENE_SHARD[804]=1; _SCENE_SHARD[824]=1; _SCENE_SHARD[854]=1; _SCENE_SHARD[880]=1
-_SCENE_SHARD[807]=2; _SCENE_SHARD[827]=2; _SCENE_SHARD[879]=2
+_SCENE_SHARD[876]=0
+_SCENE_SHARD[807]=1; _SCENE_SHARD[854]=1
+_SCENE_SHARD[879]=2
+_SCENE_SHARD[804]=3; _SCENE_SHARD[812]=3
+_SCENE_SHARD[824]=4; _SCENE_SHARD[880]=4
+_SCENE_SHARD[827]=5; _SCENE_SHARD[834]=5
 
 if [[ ${SHARD} -ge 0 ]]; then
     SHARDED=()
@@ -173,7 +179,6 @@ for SCENE in "${SCENES[@]}"; do
                 --voxel_grid   "${VOXEL_GRID}" \
                 --config       "${CONFIG}" \
                 --detr_conf_thresh          0.3 \
-                --detr_visible_gain_discount 0.45 \
                 --log_level    30 \
                 > "${EXPLORE_LOG}" 2>&1
 

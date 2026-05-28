@@ -7,7 +7,7 @@
 # appended automatically.  Each job gets a distinct name (detr_eval_s0 / s1 / s2)
 # and writes its own log via the %j SLURM job-ID token.
 
-N_SHARDS=3
+N_SHARDS=6
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [[ -z "${1}" ]]; then

@@ -8,7 +8,7 @@
 df_normalizer: 10
 df_thr: 0.3
 num_classes: 11
-input_img_size: [320, 320]
+input_img_size: [544, 720]
 focal_length: 300.0
 
 # ------ Frontier Manager ------
@@ -22,7 +22,7 @@ visited_gain_reduction_factor: 2000
 utility_gain_factor: 1.0
 
 render_K: [60.0, 0.0, 64.0, 0.0, 60.0, 64.0, 0.0, 0.0, 1.0]
-render_H: 128
+render_H: 128 
 render_W: 128
 render_d_range: 3.5
 render_decrease_factor: 1.0
@@ -35,14 +35,13 @@ depth_range: 3.5
 use_free_grid: True
 use_occ_grid: True
 min_dist2occ: 0.2
-max_dist2free: 0.15
-max_planning_time: 0.5
-planning_algo: rrtconnect
+max_dist2free: 0.075
+filter_not_in_freespace: true
+freespace_filter_dist: 1.5                 # DETR frontiers land at occluded surfaces; 1.5 m lets valid
+                                           # boundary frontiers pass while wall/exterior ones are rejected
+max_planning_time: 1.5
+planning_algo: rrtstar
 
-# ------ Frontier visited decay (mapex-calibrated, see gain_adjustment_detr) ------
-detr_visited_gain_reduction_factor: 0.7   # 0.2 (detr) too aggressive; 0.7 from mapex tuning
-detr_visited_dist_threshold: 1.0          # metres — pos3d proximity radius (no angle check)
-detr_max_n_close: 5                       # hard-retire frontier after 5 nearby visits
 
 # ------ Exploration App ------
 predict_interval: 6
